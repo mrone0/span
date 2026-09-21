@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+use fs2::FileExt;
 use span_core::{DeviceId, TrustState, broadcast_targets};
 
 use crate::clipboard::system_clipboard;
@@ -101,6 +102,13 @@ fn open_gui_command() -> io::Result<()> {
 }
 
 fn run_daemon() -> io::Result<()> {
+    let _instance_lock = acquire_daemon_instance_lock()?;
+    #[cfg(not(target_os = "macos"))]
+    std::fs::write(
+        crate::config::daemon_pid_path()?,
+        format!("{}\n", std::process::id()),
+    )?;
+
     let local = load_or_create_local_device()?;
     let store_path = trust_store_path()?;
     let store = TrustStore::load(&store_path)?;
@@ -179,72 +187,96 @@ fn run_daemon() -> io::Result<()> {
     }
 }
 
+fn acquire_daemon_instance_lock() -> io::Result<std::fs::File> {
+    let lock_path = crate::config::daemon_pid_path()?.with_file_name("daemon-instance.lock");
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path)?;
+    match FileExt::try_lock_exclusive(&lock) {
+        Ok(()) => Ok(lock),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "another span daemon is already running",
+        )),
+        Err(error) => Err(error),
+    }
+}
+
 fn spawn_discovery_listener(
     store_path: std::path::PathBuf,
     local: LocalDevice,
     latest_pending_text: Arc<Mutex<Option<String>>>,
 ) {
     thread::spawn(move || {
-        if let Err(error) = listen_forever(|message, addr| {
-            match message {
-                DiscoveryMessage::Probe => {
-                    // Reply directly to the scanner's ephemeral port. This
-                    // makes `span discover` immediate without creating a
-                    // broadcast storm between background daemons.
-                    respond_to_probe(&local, addr)?;
-                }
-                DiscoveryMessage::Announcement(packet) => {
-                    if packet.id == local.id {
-                        return Ok(());
+        loop {
+            if let Err(error) = listen_forever(|message, addr, listener| {
+                match message {
+                    DiscoveryMessage::Probe => {
+                        // Reply directly to the scanner's ephemeral port. This
+                        // makes `span discover` immediate without creating a
+                        // broadcast storm between background daemons. Reuse the
+                        // discovery listener so the reply has source port 46792;
+                        // this keeps it inside the installed firewall rule.
+                        respond_to_probe(listener, &local, addr)?;
                     }
+                    DiscoveryMessage::Announcement(packet) => {
+                        if packet.id == local.id {
+                            return Ok(());
+                        }
 
-                    let endpoint = addr.ip().to_string();
-                    let mut store = TrustStore::load(&store_path)?;
-                    let mut info = packet.into_device_info();
-                    info.endpoint = Some(endpoint.clone());
-                    let trusted_before = store.trusted_devices().iter().any(|device| {
-                        device.id == info.id
-                            || (device.public_key.is_some() && device.public_key == info.public_key)
-                    });
-                    let changed = store.record_discovered(info.clone())?;
-                    if trusted_before
-                        && store.update_endpoint_and_key(
-                            &info.id,
-                            endpoint.clone(),
-                            info.public_key.clone().unwrap_or_default(),
-                        )?
-                    {
-                        println!("updated endpoint for {}: {endpoint}", info.name);
-                    } else if changed && store.mark_pairing_prompted(&info)? {
-                        println!("discovered device: {} ({})", info.name, info.id);
-                        notify_gui_pairing_request(&info);
-                    }
-                    drop(store);
+                        let endpoint = addr.ip().to_string();
+                        let mut store = TrustStore::load(&store_path)?;
+                        let mut info = packet.into_device_info();
+                        info.endpoint = Some(endpoint.clone());
+                        let changed = store.record_discovered(info.clone())?;
+                        let trusted_now = store.trusted_devices().iter().any(|device| {
+                            device.id == info.id
+                                || (device.public_key.is_some()
+                                    && device.public_key == info.public_key)
+                        });
+                        if trusted_now
+                            && store.update_endpoint_and_key(
+                                &info.id,
+                                endpoint.clone(),
+                                info.public_key.clone().unwrap_or_default(),
+                            )?
+                        {
+                            println!("updated endpoint for {}: {endpoint}", info.name);
+                        } else if changed && store.mark_pairing_prompted(&info)? {
+                            println!("discovered device: {} ({})", info.name, info.id);
+                            notify_gui_pairing_request(&info);
+                        }
+                        drop(store);
 
-                    if trusted_before {
-                        // Repeat the encrypted pairing acknowledgement when a
-                        // trusted peer announces. This repairs one-sided trust
-                        // created by older Span versions after either app is
-                        // upgraded, without overriding an explicit revoke.
-                        let _ = send_pairing_accept_to(&local, &info);
-                        let pending = latest_pending_text
-                            .lock()
-                            .ok()
-                            .and_then(|text| text.clone());
-                        if let Some(text) = pending {
-                            broadcast_clipboard_text(
-                                &store_path,
-                                &local,
-                                latest_pending_text.clone(),
-                                text,
-                            )?;
+                        if trusted_now {
+                            // Repeat the encrypted pairing acknowledgement when a
+                            // trusted peer announces. This repairs one-sided trust
+                            // created by older Span versions after either app is
+                            // upgraded, without overriding an explicit revoke.
+                            let _ = send_pairing_accept_to(&local, &info);
+                            let pending = latest_pending_text
+                                .lock()
+                                .ok()
+                                .and_then(|text| text.clone());
+                            if let Some(text) = pending {
+                                broadcast_clipboard_text(
+                                    &store_path,
+                                    &local,
+                                    latest_pending_text.clone(),
+                                    text,
+                                )?;
+                            }
                         }
                     }
                 }
+                Ok(())
+            }) {
+                eprintln!("discovery listener stopped: {error}; retrying");
             }
-            Ok(())
-        }) {
-            eprintln!("discovery listener stopped: {error}");
+            thread::sleep(Duration::from_secs(1));
         }
     });
 }
@@ -311,45 +343,50 @@ fn spawn_receiver(local: LocalDevice, suppressed_text: Arc<Mutex<Option<String>>
             }
         };
 
-        if let Err(error) = receive_text_forever(|packet| {
-            let mut store = TrustStore::load(&trust_path)?;
-            let Some(sender) = store.device(&packet.from).cloned() else {
-                eprintln!("rejected packet from unknown device: {}", packet.from);
-                return Ok(());
-            };
+        loop {
+            if let Err(error) = receive_text_forever(|packet| {
+                let mut store = TrustStore::load(&trust_path)?;
+                let Some(sender) = store.device(&packet.from).cloned() else {
+                    eprintln!("rejected packet from unknown device: {}", packet.from);
+                    return Ok(());
+                };
 
-            let Some(sender_key) = sender.public_key.as_deref() else {
-                eprintln!("rejected text from device without key: {}", packet.from);
-                return Ok(());
-            };
+                let Some(sender_key) = sender.public_key.as_deref() else {
+                    eprintln!("rejected text from device without key: {}", packet.from);
+                    return Ok(());
+                };
 
-            let text = decrypt_text(&packet, &local.private_key, sender_key)?;
-            if packet.kind == EncryptedPacketKind::PairingAccept && text == PAIRING_ACCEPT_TEXT {
-                if matches!(
-                    sender.trust_state,
-                    TrustState::Discovered | TrustState::Pending
-                ) {
-                    store.trust_existing(&packet.from)?;
-                    println!("pairing accepted by {}", sender.name);
+                let text = decrypt_text(&packet, &local.private_key, sender_key)?;
+                if packet.kind == EncryptedPacketKind::PairingAccept && text == PAIRING_ACCEPT_TEXT
+                {
+                    if matches!(
+                        sender.trust_state,
+                        TrustState::Discovered | TrustState::Pending
+                    ) {
+                        store.trust_existing(&packet.from)?;
+                        println!("pairing accepted by {}", sender.name);
+                    }
+                    return Ok(());
                 }
-                return Ok(());
-            }
 
-            if packet.kind != EncryptedPacketKind::Text || sender.trust_state != TrustState::Trusted
-            {
-                eprintln!("rejected text from untrusted device: {}", packet.from);
-                return Ok(());
-            }
+                if packet.kind != EncryptedPacketKind::Text
+                    || sender.trust_state != TrustState::Trusted
+                {
+                    eprintln!("rejected text from untrusted device: {}", packet.from);
+                    return Ok(());
+                }
 
-            let mut clipboard = system_clipboard();
-            clipboard.write_text(&text)?;
-            if let Ok(mut suppressed) = suppressed_text.lock() {
-                *suppressed = Some(text);
+                let mut clipboard = system_clipboard();
+                clipboard.write_text(&text)?;
+                if let Ok(mut suppressed) = suppressed_text.lock() {
+                    *suppressed = Some(text);
+                }
+                println!("received text from {}", packet.from);
+                Ok(())
+            }) {
+                eprintln!("receiver stopped: {error}; retrying");
             }
-            println!("received text from {}", packet.from);
-            Ok(())
-        }) {
-            eprintln!("receiver stopped: {error}");
+            thread::sleep(Duration::from_secs(1));
         }
     });
 }
@@ -464,7 +501,6 @@ fn refresh_trusted_endpoints(
     }
 
     let mut store = TrustStore::load(store_path)?;
-    let mut changed = false;
     for (packet, addr) in discovered {
         let endpoint = addr.ip().to_string();
         for trusted in store
@@ -482,16 +518,12 @@ fn refresh_trusted_endpoints(
             if !same_identity {
                 continue;
             }
-            changed |= store.update_endpoint_and_key(
+            let _ = store.update_endpoint_and_key(
                 &trusted.id,
                 endpoint.clone(),
                 packet.public_key.clone(),
             )?;
         }
-    }
-
-    if changed {
-        store.save_now()?;
     }
     Ok(())
 }
@@ -513,10 +545,8 @@ fn retry_send_after_discovery(
 
         let endpoint = addr.ip().to_string();
         let mut store = TrustStore::load(store_path)?;
-        if let Some(trusted) = store.trusted_device_mut(&device.id) {
-            trusted.endpoint = Some(endpoint.clone());
-            store.save_now()?;
-        }
+        let _ =
+            store.update_endpoint_and_key(&device.id, endpoint.clone(), public_key.to_string())?;
 
         match send_text((endpoint.as_str(), TEXT_PORT), packet) {
             Ok(()) => return Ok(true),
@@ -735,6 +765,13 @@ fn install_span() -> io::Result<()> {
 fn restart_daemon() -> io::Result<()> {
     stop_daemon()?;
     thread::sleep(Duration::from_millis(200));
+    #[cfg(target_os = "macos")]
+    {
+        // `stop` unloads the LaunchAgent so KeepAlive does not immediately
+        // respawn it. Reinstall it before starting again instead of falling
+        // back to an unmanaged standalone process.
+        autostart::install()?;
+    }
     start_daemon()
 }
 
@@ -848,6 +885,7 @@ fn print_help() {
 }
 
 fn uninstall_autostart() -> io::Result<()> {
+    stop_daemon()?;
     let path = autostart::uninstall()?;
     println!("removed autostart: {}", path.display());
     Ok(())

@@ -109,13 +109,27 @@ pub fn receive_text_forever(
     let listener = TcpListener::bind(("0.0.0.0", TEXT_PORT))?;
 
     for stream in listener.incoming() {
-        match stream.and_then(read_packet) {
-            Ok(packet) => on_packet(packet)?,
-            Err(error) => eprintln!("receive error: {error}"),
-        }
+        dispatch_received_packet(stream.and_then(read_packet), &mut on_packet);
     }
 
     Ok(())
+}
+
+fn dispatch_received_packet(
+    received: io::Result<EncryptedTextPacket>,
+    on_packet: &mut impl FnMut(EncryptedTextPacket) -> io::Result<()>,
+) {
+    match received {
+        Ok(packet) => {
+            if let Err(error) = on_packet(packet) {
+                // Authentication, trust-store, or clipboard failures are
+                // scoped to one packet. A malformed/stale peer must not
+                // permanently stop clipboard reception for every device.
+                eprintln!("packet processing error: {error}");
+            }
+        }
+        Err(error) => eprintln!("receive error: {error}"),
+    }
 }
 
 fn write_packet(mut writer: impl Write, packet: &EncryptedTextPacket) -> io::Result<()> {
@@ -256,5 +270,29 @@ mod tests {
             read_packet(Cursor::new(bytes)).unwrap().kind,
             EncryptedPacketKind::PairingAccept
         );
+    }
+
+    #[test]
+    fn packet_callback_error_does_not_stop_later_packets() {
+        let packet = EncryptedTextPacket {
+            kind: EncryptedPacketKind::Text,
+            from: DeviceId::new("sender").unwrap(),
+            nonce: [0; NONCE_BYTES],
+            ciphertext: Vec::new(),
+        };
+        let mut calls = 0;
+        let mut callback = |_packet| {
+            calls += 1;
+            if calls == 1 {
+                Err(io::Error::new(io::ErrorKind::InvalidData, "bad packet"))
+            } else {
+                Ok(())
+            }
+        };
+
+        dispatch_received_packet(Ok(packet.clone()), &mut callback);
+        dispatch_received_packet(Ok(packet), &mut callback);
+
+        assert_eq!(calls, 2);
     }
 }

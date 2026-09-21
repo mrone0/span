@@ -9,7 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 use windows_sys::Win32::{
-    Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM},
+    Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
     Graphics::Gdi::{
         BeginPaint, COLOR_WINDOW, CreateFontW, CreateSolidBrush, DC_BRUSH, DC_PEN, DT_CENTER,
         DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawTextW, EndPaint, FillRect,
@@ -24,6 +24,11 @@ use windows_sys::Win32::{
         Controls::{DRAWITEMSTRUCT, ODS_DISABLED, ODS_FOCUS, ODS_SELECTED},
         HiDpi::*,
         Input::KeyboardAndMouse::EnableWindow,
+        Shell::{
+            NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_SETFOCUS,
+            NIM_SETVERSION, NIN_SELECT, NINF_KEY, NOTIFYICON_VERSION_4, NOTIFYICONDATAW,
+            Shell_NotifyIconW,
+        },
         WindowsAndMessaging::*,
     },
 };
@@ -31,7 +36,13 @@ use windows_sys::Win32::{
 const ADD: u16 = 1001;
 const REMOVE: u16 = 1002;
 const PICKER: u16 = 1003;
+const TRAY_OPEN: u16 = 1101;
+const TRAY_EXIT: u16 = 1102;
 const TIMER: usize = 1;
+const APP_ICON_ID: u16 = 101;
+const TRAY_ICON_ID: u32 = 1;
+const TRAY_MESSAGE: u32 = WM_APP + 1;
+const NIN_KEYSELECT: u32 = NIN_SELECT | NINF_KEY;
 const WIDTH: i32 = 540;
 const HEIGHT: i32 = 440;
 const STYLE: u32 = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
@@ -72,6 +83,9 @@ struct State {
     has_trusted: bool,
     last_refresh: Instant,
     store_initialized: bool,
+    tray_icon: NOTIFYICONDATAW,
+    tray_added: bool,
+    taskbar_created_message: u32,
 }
 enum Outcome {
     Discovered(Vec<DeviceInfo>),
@@ -102,6 +116,16 @@ pub fn prompt_pairing(device_id: &str, name: &str, platform: &str) -> io::Result
 }
 
 pub fn open() -> io::Result<()> {
+    let start_hidden = std::env::args_os().any(|argument| argument == "--hidden");
+    unsafe {
+        let existing = FindWindowW(wide("SpanGuiWindow").as_ptr(), ptr::null());
+        if !existing.is_null() {
+            if !start_hidden {
+                show_main_window(existing);
+            }
+            return Ok(());
+        }
+    }
     let local = crate::config::load_or_create_local_device()?;
     let autostart_error = crate::autostart::install().err();
     // The installer can replace span.exe while the previous background
@@ -116,7 +140,7 @@ pub fn open() -> io::Result<()> {
     unsafe {
         // Thread-local context also works if another entry point already set process awareness.
         let previous = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-        let result = run_window(&local, autostart_error, daemon_error);
+        let result = run_window(&local, autostart_error, daemon_error, start_hidden);
         if !previous.is_null() {
             SetThreadDpiAwarenessContext(previous);
         }
@@ -128,18 +152,29 @@ unsafe fn run_window(
     local: &crate::config::LocalDevice,
     autostart_error: Option<io::Error>,
     daemon_error: Option<io::Error>,
+    start_hidden: bool,
 ) -> io::Result<()> {
     let instance = GetModuleHandleW(ptr::null());
     if instance.is_null() {
         return Err(io::Error::last_os_error());
     }
     let class_name = wide("SpanGuiWindow");
+    let existing = FindWindowW(class_name.as_ptr(), ptr::null());
+    if !existing.is_null() {
+        if !start_hidden {
+            show_main_window(existing);
+        }
+        return Ok(());
+    }
+    let large_icon = load_app_icon(instance, SM_CXICON, SM_CYICON);
+    let small_icon = load_app_icon(instance, SM_CXSMICON, SM_CYSMICON);
     let class = WNDCLASSW {
         lpfnWndProc: Some(window_proc),
         hInstance: instance,
         lpszClassName: class_name.as_ptr(),
         hbrBackground: (COLOR_WINDOW + 1) as usize as _,
         hCursor: LoadCursorW(ptr::null_mut(), IDC_ARROW),
+        hIcon: large_icon,
         ..std::mem::zeroed()
     };
     RegisterClassW(&class);
@@ -179,8 +214,14 @@ unsafe fn run_window(
             has_trusted: false,
             last_refresh: Instant::now(),
             store_initialized: false,
+            tray_icon: make_tray_icon(hwnd, small_icon),
+            tray_added: false,
+            taskbar_created_message: RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()),
         })
     });
+    restore_tray_icon();
+    SendMessageW(hwnd, WM_SETICON, ICON_SMALL as usize, small_icon as LPARAM);
+    SendMessageW(hwnd, WM_SETICON, ICON_BIG as usize, large_icon as LPARAM);
     if let Err(error) = create_controls(hwnd, local) {
         DestroyWindow(hwnd);
         return Err(error);
@@ -194,23 +235,29 @@ unsafe fn run_window(
     if let Err(error) = refresh() {
         set_status(&format!("读取可信设备失败：{error}"));
     }
-    ShowWindow(hwnd, SW_SHOW);
+    if !start_hidden {
+        ShowWindow(hwnd, SW_SHOW);
+    }
     if let Some(error) = daemon_error {
         set_status("后台同步启动失败，请重新打开 Span 重试。");
-        alert(
-            hwnd,
-            &format!(
-                "后台同步启动失败，当前无法保证剪贴板同步。\r\n\r\n{error}\r\n\r\n请重新打开 Span 重试。"
-            ),
-            MB_OK | MB_ICONERROR,
-        );
+        if !start_hidden {
+            alert(
+                hwnd,
+                &format!(
+                    "后台同步启动失败，当前无法保证剪贴板同步。\r\n\r\n{error}\r\n\r\n请重新打开 Span 重试。"
+                ),
+                MB_OK | MB_ICONERROR,
+            );
+        }
     }
     if let Some(error) = autostart_error {
-        alert(
-            hwnd,
-            &format!("未能设置开机自启，仍可使用此窗口。\r\n\r\n{error}"),
-            MB_OK | MB_ICONWARNING,
-        );
+        if !start_hidden {
+            alert(
+                hwnd,
+                &format!("未能设置开机自启，仍可使用此窗口。\r\n\r\n{error}"),
+                MB_OK | MB_ICONWARNING,
+            );
+        }
     }
     let mut message: MSG = std::mem::zeroed();
     loop {
@@ -238,14 +285,46 @@ unsafe extern "system" fn window_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    let taskbar_created_message = STATE.with(|state| {
+        state
+            .borrow()
+            .as_ref()
+            .map_or(0, |state| state.taskbar_created_message)
+    });
+    if taskbar_created_message != 0 && message == taskbar_created_message {
+        restore_tray_icon();
+        return 0;
+    }
+
     match message {
         WM_COMMAND => {
             let id = (wparam & 0xffff) as u16;
             let code = (wparam >> 16) as u32;
-            if id == PICKER && code == CBN_SELCHANGE {
+            if id == TRAY_OPEN {
+                show_main_window(hwnd);
+            } else if id == TRAY_EXIT {
+                let busy = STATE.with(|s| s.borrow().as_ref().is_some_and(|s| s.busy));
+                if busy {
+                    show_main_window(hwnd);
+                    set_status("正在处理设备操作，请稍候再退出 Span。");
+                } else {
+                    DestroyWindow(hwnd);
+                }
+            } else if id == PICKER && code == CBN_SELCHANGE {
                 update_controls();
             } else if code == BN_CLICKED && (id == ADD || id == REMOVE) {
                 start_action(hwnd, id);
+            }
+            0
+        }
+        TRAY_MESSAGE => {
+            let event = (lparam as u32) & 0xffff;
+            match event {
+                NIN_SELECT | NIN_KEYSELECT | WM_LBUTTONUP | WM_LBUTTONDBLCLK => {
+                    show_main_window(hwnd);
+                }
+                WM_CONTEXTMENU | WM_RBUTTONUP => show_tray_menu(hwnd),
+                _ => {}
             }
             0
         }
@@ -297,7 +376,12 @@ unsafe extern "system" fn window_proc(
             if busy {
                 set_status("正在处理设备操作，请稍候再关闭窗口。");
             } else {
-                DestroyWindow(hwnd);
+                let tray_added = STATE.with(|s| s.borrow().as_ref().is_some_and(|s| s.tray_added));
+                if tray_added {
+                    ShowWindow(hwnd, SW_HIDE);
+                } else {
+                    DestroyWindow(hwnd);
+                }
             }
             0
         }
@@ -306,6 +390,9 @@ unsafe extern "system" fn window_proc(
             // Dropping the receiver safely discards any late worker result (no HWND or raw payload).
             STATE.with(|s| {
                 if let Some(s) = s.borrow_mut().take() {
+                    if s.tray_added {
+                        Shell_NotifyIconW(NIM_DELETE, &s.tray_icon);
+                    }
                     for font in s.fonts {
                         DeleteObject(font);
                     }
@@ -315,6 +402,116 @@ unsafe extern "system" fn window_proc(
             0
         }
         _ => DefWindowProcW(hwnd, message, wparam, lparam),
+    }
+}
+
+unsafe fn load_app_icon(
+    instance: windows_sys::Win32::Foundation::HINSTANCE,
+    cx: i32,
+    cy: i32,
+) -> HICON {
+    let icon = LoadImageW(
+        instance,
+        APP_ICON_ID as usize as *const u16,
+        IMAGE_ICON,
+        GetSystemMetrics(cx),
+        GetSystemMetrics(cy),
+        LR_SHARED,
+    ) as HICON;
+    if icon.is_null() {
+        LoadIconW(ptr::null_mut(), IDI_APPLICATION)
+    } else {
+        icon
+    }
+}
+
+fn copy_wide(target: &mut [u16], text: &str) {
+    for (slot, value) in target.iter_mut().zip(wide(text)) {
+        *slot = value;
+    }
+}
+
+unsafe fn make_tray_icon(hwnd: HWND, icon: HICON) -> NOTIFYICONDATAW {
+    let mut data: NOTIFYICONDATAW = std::mem::zeroed();
+    data.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+    data.hWnd = hwnd;
+    data.uID = TRAY_ICON_ID;
+    data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP;
+    data.uCallbackMessage = TRAY_MESSAGE;
+    data.hIcon = icon;
+    copy_wide(&mut data.szTip, "Span · 跨设备剪贴板同步中");
+    data
+}
+
+unsafe fn add_tray_icon(data: &mut NOTIFYICONDATAW) -> bool {
+    if Shell_NotifyIconW(NIM_ADD, data) == 0 {
+        return false;
+    }
+    data.Anonymous.uVersion = NOTIFYICON_VERSION_4;
+    Shell_NotifyIconW(NIM_SETVERSION, data);
+    true
+}
+
+unsafe fn restore_tray_icon() {
+    let data = STATE.with(|state| state.borrow().as_ref().map(|state| state.tray_icon));
+    let Some(mut data) = data else {
+        return;
+    };
+    let added = add_tray_icon(&mut data);
+    STATE.with(|state| {
+        if let Some(state) = state.borrow_mut().as_mut() {
+            state.tray_icon = data;
+            state.tray_added = added;
+        }
+    });
+}
+
+unsafe fn show_main_window(hwnd: HWND) {
+    ShowWindow(hwnd, SW_RESTORE);
+    SetForegroundWindow(hwnd);
+}
+
+unsafe fn show_tray_menu(hwnd: HWND) {
+    let menu = CreatePopupMenu();
+    if menu.is_null() {
+        return;
+    }
+    AppendMenuW(
+        menu,
+        MF_STRING,
+        TRAY_OPEN as usize,
+        wide("打开 Span").as_ptr(),
+    );
+    AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
+    AppendMenuW(
+        menu,
+        MF_STRING,
+        TRAY_EXIT as usize,
+        wide("退出 Span").as_ptr(),
+    );
+    SetMenuDefaultItem(menu, u32::from(TRAY_OPEN), 0);
+
+    let mut point: POINT = std::mem::zeroed();
+    GetCursorPos(&mut point);
+    SetForegroundWindow(hwnd);
+    let command = TrackPopupMenu(
+        menu,
+        TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_LEFTALIGN | TPM_BOTTOMALIGN,
+        point.x,
+        point.y,
+        0,
+        hwnd,
+        ptr::null(),
+    );
+    DestroyMenu(menu);
+    PostMessageW(hwnd, WM_NULL, 0, 0);
+
+    let tray_icon = STATE.with(|state| state.borrow().as_ref().map(|state| state.tray_icon));
+    if let Some(tray_icon) = tray_icon {
+        Shell_NotifyIconW(NIM_SETFOCUS, &tray_icon);
+    }
+    if command != 0 {
+        SendMessageW(hwnd, WM_COMMAND, command as usize, 0);
     }
 }
 
@@ -457,7 +654,7 @@ unsafe fn create_controls(hwnd: HWND, local: &crate::config::LocalDevice) -> io:
         hwnd,
         "COMBOBOX",
         "",
-        (176, 354, 128, 180),
+        (96, 354, 258, 180),
         PICKER,
         WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST as u32,
         TextStyle::Status,
@@ -466,7 +663,7 @@ unsafe fn create_controls(hwnd: HWND, local: &crate::config::LocalDevice) -> io:
         hwnd,
         "BUTTON",
         "移除",
-        (312, 354, 82, 30),
+        (362, 354, 82, 30),
         REMOVE,
         WS_TABSTOP | BS_OWNERDRAW as u32,
         TextStyle::Status,
@@ -617,8 +814,8 @@ unsafe fn paint_window(hwnd: HWND) {
         let Some(s) = state.as_ref() else {
             return;
         };
-        SetDCBrushColor(hdc, rgb(10, 132, 255));
-        SetDCPenColor(hdc, rgb(10, 132, 255));
+        SetDCBrushColor(hdc, rgb(20, 34, 55));
+        SetDCPenColor(hdc, rgb(20, 34, 55));
         RoundRect(
             hdc,
             scale(28, dpi),
@@ -670,13 +867,24 @@ unsafe fn paint_window(hwnd: HWND) {
             right: scale(52, dpi),
             bottom: scale(42, dpi),
         };
-        let value = wide("S");
+        let value = wide("N");
         DrawTextW(
             hdc,
             value.as_ptr(),
             -1,
             &mut logo,
             DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+        );
+        SetDCBrushColor(hdc, rgb(69, 207, 216));
+        SetDCPenColor(hdc, rgb(69, 207, 216));
+        RoundRect(
+            hdc,
+            scale(34, dpi),
+            scale(34, dpi),
+            scale(45, dpi),
+            scale(37, dpi),
+            scale(3, dpi),
+            scale(3, dpi),
         );
     });
     SelectObject(hdc, old_pen);

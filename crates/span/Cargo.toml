@@ -8,6 +8,7 @@ span-core = { path = "../span-core" }
 chacha20poly1305 = { version = "0.10", default-features = false, features = ["std"] }
 hkdf = "0.12"
 get_if_addrs = "0.5.3"
+fs2 = "0.4.3"
 rand_core = { version = "0.6", features = ["getrandom"] }
 sha2 = "0.10"
 x25519-dalek = { version = "2", default-features = false, features = ["static_secrets"] }
@@ -23,8 +24,12 @@ windows-sys = { version = "0.59", features = [
   "Win32_System_LibraryLoader",
   "Win32_Graphics_Gdi",
   "Win32_UI_WindowsAndMessaging",
+  "Win32_UI_Shell",
   "Win32_UI_Controls",
   "Win32_UI_HiDpi",
   "Win32_UI_Input_KeyboardAndMouse",
   "Win32_System_Threading",
 ] }
+
+[build-dependencies]
+embed-resource = "3.0.11"

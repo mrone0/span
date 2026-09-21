@@ -1,5 +1,6 @@
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use span_core::{DeviceId, DeviceInfo, Platform, TrustState};
@@ -83,9 +84,7 @@ pub fn discover_once(
                     }
                 }
             }
-            Err(error)
-                if error.kind() == io::ErrorKind::WouldBlock
-                    || error.kind() == io::ErrorKind::TimedOut => {}
+            Err(error) if is_transient_udp_error(&error) => {}
             Err(error) => return Err(error),
         }
     }
@@ -142,27 +141,57 @@ fn subnet_broadcast(ip: Ipv4Addr, netmask: Ipv4Addr) -> Ipv4Addr {
     Ipv4Addr::from(u32::from(ip) | !u32::from(netmask))
 }
 
-pub fn respond_to_probe(device: &LocalDevice, target: SocketAddr) -> io::Result<()> {
-    let socket = UdpSocket::bind(("0.0.0.0", 0))?;
+pub fn respond_to_probe(
+    socket: &UdpSocket,
+    device: &LocalDevice,
+    target: SocketAddr,
+) -> io::Result<()> {
     let packet = encode_packet(&DiscoveryPacket::from_local(device));
     socket.send_to(packet.as_bytes(), target)?;
     Ok(())
 }
 
 pub fn listen_forever(
-    mut on_message: impl FnMut(DiscoveryMessage, SocketAddr) -> io::Result<()>,
+    mut on_message: impl FnMut(DiscoveryMessage, SocketAddr, &UdpSocket) -> io::Result<()>,
 ) -> io::Result<()> {
     let socket = UdpSocket::bind(("0.0.0.0", DISCOVERY_PORT))?;
     let mut buffer = [0_u8; 1024];
 
     loop {
-        let (len, addr) = socket.recv_from(&mut buffer)?;
+        let (len, addr) = match socket.recv_from(&mut buffer) {
+            Ok(received) => received,
+            Err(error) if is_transient_udp_error(&error) => {
+                // A UDP send can surface an asynchronous ICMP error on the
+                // next receive (for example when a stale peer leaves Wi-Fi).
+                // That peer must not permanently take discovery offline.
+                eprintln!("ignoring transient discovery receive error: {error}");
+                thread::sleep(Duration::from_millis(50));
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         if let Ok(value) = std::str::from_utf8(&buffer[..len]) {
             if let Some(message) = decode_message(value) {
-                on_message(message, addr)?;
+                if let Err(error) = on_message(message, addr, &socket) {
+                    // Bad state or an unreachable peer affects only this
+                    // datagram. Keep listening for the next device.
+                    eprintln!("failed to process discovery message from {addr}: {error}");
+                }
             }
         }
     }
+}
+
+fn is_transient_udp_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::WouldBlock
+            | io::ErrorKind::TimedOut
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::HostUnreachable
+            | io::ErrorKind::NetworkUnreachable
+    )
 }
 
 fn encode_packet(packet: &DiscoveryPacket) -> String {
@@ -232,5 +261,46 @@ mod tests {
             subnet_broadcast(Ipv4Addr::new(10, 4, 7, 8), Ipv4Addr::new(255, 255, 0, 0)),
             Ipv4Addr::new(10, 4, 255, 255)
         );
+    }
+
+    #[test]
+    fn probe_response_reuses_the_listener_socket() {
+        let listener = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let scanner = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        scanner
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let device = LocalDevice {
+            id: DeviceId::new("listener-device").unwrap(),
+            name: "Listener".to_string(),
+            platform: Platform::Linux,
+            private_key: [0; 32],
+            public_key: [1; 32],
+        };
+
+        respond_to_probe(&listener, &device, scanner.local_addr().unwrap()).unwrap();
+
+        let mut buffer = [0_u8; 1024];
+        let (len, source) = scanner.recv_from(&mut buffer).unwrap();
+        assert_eq!(source, listener.local_addr().unwrap());
+        assert!(matches!(
+            std::str::from_utf8(&buffer[..len])
+                .ok()
+                .and_then(decode_message),
+            Some(DiscoveryMessage::Announcement(_))
+        ));
+    }
+
+    #[test]
+    fn unreachable_udp_peer_is_transient() {
+        assert!(is_transient_udp_error(&io::Error::from(
+            io::ErrorKind::HostUnreachable
+        )));
+        assert!(is_transient_udp_error(&io::Error::from(
+            io::ErrorKind::ConnectionReset
+        )));
+        assert!(!is_transient_udp_error(&io::Error::from(
+            io::ErrorKind::InvalidData
+        )));
     }
 }

@@ -6,9 +6,23 @@ use crate::config::{cli_executable_path, daemon_log_path, daemon_pid_path};
 
 pub fn start_daemon() -> io::Result<()> {
     #[cfg(target_os = "macos")]
-    if launch_agent_loaded() {
-        println!("span daemon already running (launch agent)");
-        return Ok(());
+    let launch_agent_state = crate::autostart::macos_launch_agent_state();
+    #[cfg(target_os = "macos")]
+    if launch_agent_state != crate::autostart::LaunchAgentState::NotLoaded {
+        stop_standalone_daemon_if_present()?;
+    }
+    #[cfg(target_os = "macos")]
+    match launch_agent_state {
+        crate::autostart::LaunchAgentState::Running => {
+            println!("span daemon already running (launch agent)");
+            return Ok(());
+        }
+        crate::autostart::LaunchAgentState::Loaded => {
+            crate::autostart::kickstart_macos_launch_agent()?;
+            println!("span daemon started (launch agent)");
+            return Ok(());
+        }
+        crate::autostart::LaunchAgentState::NotLoaded => {}
     }
 
     let pid_path = daemon_pid_path()?;
@@ -50,22 +64,63 @@ pub fn start_daemon() -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
+fn stop_standalone_daemon_if_present() -> io::Result<()> {
+    let pid_path = daemon_pid_path()?;
+    let Some(pid) = read_pid(&pid_path)? else {
+        return Ok(());
+    };
+
+    if process_running(pid) && process_is_span_daemon(pid)? {
+        terminate_process(pid)?;
+        println!("stopped legacy standalone span daemon (pid {pid})");
+    }
+    let _ = fs::remove_file(pid_path);
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn process_is_span_daemon(pid: u32) -> io::Result<bool> {
+    let output = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "command="])
+        .output()?;
+    if !output.status.success() {
+        return Ok(false);
+    }
+    let command = String::from_utf8_lossy(&output.stdout);
+    let executable = cli_executable_path()?;
+    Ok(command
+        .trim_start()
+        .starts_with(&executable.to_string_lossy().to_string())
+        && command.split_whitespace().any(|argument| argument == "run"))
+}
+
 pub fn stop_daemon() -> io::Result<()> {
     #[cfg(target_os = "macos")]
-    if stop_launch_agent()? {
-        let pid_path = daemon_pid_path()?;
-        let _ = fs::remove_file(pid_path);
+    let launch_agent_stopped = stop_launch_agent()?;
+    #[cfg(not(target_os = "macos"))]
+    let launch_agent_stopped = false;
+
+    if launch_agent_stopped {
         println!("stopped span daemon (launch agent)");
-        return Ok(());
     }
 
     let pid_path = daemon_pid_path()?;
     let Some(pid) = read_pid(&pid_path)? else {
-        println!("span daemon is not running");
+        if !launch_agent_stopped {
+            println!("span daemon is not running");
+        }
         return Ok(());
     };
 
     if !process_running(pid) {
+        let _ = fs::remove_file(&pid_path);
+        println!("stale pid file removed ({pid})");
+        return Ok(());
+    }
+
+    #[cfg(target_os = "macos")]
+    if !process_is_span_daemon(pid)? {
         let _ = fs::remove_file(&pid_path);
         println!("stale pid file removed ({pid})");
         return Ok(());
@@ -84,13 +139,7 @@ fn launch_agent_service() -> String {
 
 #[cfg(target_os = "macos")]
 fn launch_agent_loaded() -> bool {
-    std::process::Command::new("launchctl")
-        .args(["print", &launch_agent_service()])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+    crate::autostart::macos_launch_agent_state() != crate::autostart::LaunchAgentState::NotLoaded
 }
 
 #[cfg(target_os = "macos")]

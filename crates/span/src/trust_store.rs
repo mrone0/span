@@ -1,7 +1,9 @@
-use std::fs;
+use std::ffi::OsString;
+use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+use fs2::FileExt;
 use span_core::{DeviceId, DeviceInfo, Platform, TrustState};
 
 use crate::config::{parse_platform, platform_name, sanitize};
@@ -14,19 +16,22 @@ pub struct TrustStore {
 impl TrustStore {
     pub fn load(path: impl Into<PathBuf>) -> io::Result<Self> {
         let path = path.into();
-        let mut devices = if path.exists() {
-            parse_devices(&fs::read_to_string(&path)?)
-        } else {
-            Vec::new()
-        };
+        let mut devices = with_shared_lock(&path, || read_devices_unlocked(&path))?;
         let raw_devices = devices.clone();
         normalize_devices(&mut devices);
-        let store = Self { path, devices };
-        if store.devices != raw_devices {
-            store.save()?;
+        if devices != raw_devices {
+            devices = with_exclusive_lock(&path, || {
+                let mut latest = read_devices_unlocked(&path)?;
+                let raw_latest = latest.clone();
+                normalize_devices(&mut latest);
+                if latest != raw_latest {
+                    save_devices_unlocked(&path, &latest)?;
+                }
+                Ok(latest)
+            })?;
         }
 
-        Ok(store)
+        Ok(Self { path, devices })
     }
 
     pub fn devices(&self) -> &[DeviceInfo] {
@@ -46,36 +51,22 @@ impl TrustStore {
             .find(|device| &device.id == id && device.trust_state == TrustState::Trusted)
     }
 
-    pub fn trusted_device_mut(&mut self, id: &DeviceId) -> Option<&mut DeviceInfo> {
-        self.devices
-            .iter_mut()
-            .find(|device| &device.id == id && device.trust_state == TrustState::Trusted)
-    }
-
-    pub fn save_now(&self) -> io::Result<()> {
-        self.save()
-    }
-
     pub fn device(&self, id: &DeviceId) -> Option<&DeviceInfo> {
         self.devices.iter().find(|device| &device.id == id)
     }
 
     pub fn trust_existing(&mut self, id: &DeviceId) -> io::Result<bool> {
-        let Some(index) = self.devices.iter().position(|device| &device.id == id) else {
-            return Ok(false);
-        };
-        let trusted_name = self.devices[index].name.clone();
-        let trusted_platform = self.devices[index].platform;
-        self.devices[index].trust_state = TrustState::Trusted;
-        demote_same_advertised_trusted_devices(
-            &mut self.devices,
-            id,
-            &trusted_name,
-            trusted_platform,
-        );
-        normalize_devices(&mut self.devices);
-        self.save()?;
-        Ok(true)
+        self.with_latest_devices(|devices| {
+            let Some(index) = devices.iter().position(|device| &device.id == id) else {
+                return Ok((false, false));
+            };
+            let trusted_name = devices[index].name.clone();
+            let trusted_platform = devices[index].platform;
+            devices[index].trust_state = TrustState::Trusted;
+            demote_same_advertised_trusted_devices(devices, id, &trusted_name, trusted_platform);
+            normalize_devices(devices);
+            Ok((true, true))
+        })
     }
 
     pub fn trust(
@@ -86,95 +77,95 @@ impl TrustStore {
         endpoint: Option<String>,
         public_key: Option<String>,
     ) -> io::Result<()> {
-        let trusted_id = id.clone();
-        let trusted_name = name.clone();
-        let trusted_platform = platform;
-        if let Some(device) = self.devices.iter_mut().find(|device| device.id == id) {
-            device.name = name;
-            device.platform = platform;
-            device.trust_state = TrustState::Trusted;
-            if endpoint.is_some() {
-                device.endpoint = endpoint;
+        self.with_latest_devices(move |devices| {
+            let trusted_id = id.clone();
+            let trusted_name = name.clone();
+            let trusted_platform = platform;
+            if let Some(device) = devices.iter_mut().find(|device| device.id == id) {
+                device.name = name;
+                device.platform = platform;
+                device.trust_state = TrustState::Trusted;
+                if endpoint.is_some() {
+                    device.endpoint = endpoint;
+                }
+                if public_key.is_some() {
+                    device.public_key = public_key;
+                }
+            } else {
+                devices.push(DeviceInfo {
+                    id,
+                    name,
+                    platform,
+                    trust_state: TrustState::Trusted,
+                    endpoint,
+                    public_key,
+                });
             }
-            if public_key.is_some() {
-                device.public_key = public_key;
-            }
-        } else {
-            self.devices.push(DeviceInfo {
-                id,
-                name,
-                platform,
-                trust_state: TrustState::Trusted,
-                endpoint,
-                public_key,
-            });
-        }
-        demote_same_advertised_trusted_devices(
-            &mut self.devices,
-            &trusted_id,
-            &trusted_name,
-            trusted_platform,
-        );
-        normalize_devices(&mut self.devices);
-        self.save()
+            demote_same_advertised_trusted_devices(
+                devices,
+                &trusted_id,
+                &trusted_name,
+                trusted_platform,
+            );
+            normalize_devices(devices);
+            Ok(((), true))
+        })
     }
 
-    pub fn record_discovered(&mut self, mut discovered: DeviceInfo) -> io::Result<bool> {
-        let Some(index) = find_existing_device_index(&self.devices, &discovered) else {
-            self.devices.push(discovered);
-            normalize_devices(&mut self.devices);
-            self.save()?;
-            return Ok(true);
-        };
-        let existing = &mut self.devices[index];
+    pub fn record_discovered(&mut self, discovered: DeviceInfo) -> io::Result<bool> {
+        self.with_latest_devices(move |devices| {
+            let mut discovered = discovered;
+            let Some(index) = find_existing_device_index(devices, &discovered) else {
+                devices.push(discovered);
+                normalize_devices(devices);
+                return Ok((true, true));
+            };
+            let existing = &mut devices[index];
 
-        if existing.trust_state == TrustState::Blocked {
-            return Ok(false);
-        }
-
-        // Revocation blocks automatic re-trust, but keep the device's live
-        // address fresh so an explicit manual scan can add it again later.
-        if existing.trust_state == TrustState::Revoked {
-            if existing
-                .public_key
-                .as_deref()
-                .zip(discovered.public_key.as_deref())
-                .is_some_and(|(old, new)| old != new)
-            {
-                self.devices.push(discovered);
-                normalize_devices(&mut self.devices);
-                self.save()?;
-                return Ok(false);
+            if existing.trust_state == TrustState::Blocked {
+                return Ok((false, false));
             }
-            discovered.trust_state = TrustState::Revoked;
+
+            // Revocation blocks automatic re-trust, but keep the device's live
+            // address fresh so an explicit manual scan can add it again later.
+            if existing.trust_state == TrustState::Revoked {
+                if existing
+                    .public_key
+                    .as_deref()
+                    .zip(discovered.public_key.as_deref())
+                    .is_some_and(|(old, new)| old != new)
+                {
+                    devices.push(discovered);
+                    normalize_devices(devices);
+                    return Ok((false, true));
+                }
+                discovered.trust_state = TrustState::Revoked;
+                let changed = *existing != discovered;
+                if changed {
+                    *existing = discovered;
+                }
+                return Ok((changed, changed));
+            }
+
+            if let (Some(existing_key), Some(discovered_key)) = (
+                existing.public_key.as_deref(),
+                discovered.public_key.as_deref(),
+            ) {
+                if existing_key != discovered_key {
+                    devices.push(discovered);
+                    normalize_devices(devices);
+                    return Ok((false, true));
+                }
+            }
+
+            discovered.trust_state = existing.trust_state;
             let changed = *existing != discovered;
             if changed {
                 *existing = discovered;
-                self.save()?;
+                normalize_devices(devices);
             }
-            return Ok(changed);
-        }
-
-        if let (Some(existing_key), Some(discovered_key)) = (
-            existing.public_key.as_deref(),
-            discovered.public_key.as_deref(),
-        ) {
-            if existing_key != discovered_key {
-                self.devices.push(discovered);
-                normalize_devices(&mut self.devices);
-                self.save()?;
-                return Ok(false);
-            }
-        }
-
-        discovered.trust_state = existing.trust_state;
-        let changed = *existing != discovered;
-        if changed {
-            *existing = discovered;
-            normalize_devices(&mut self.devices);
-            self.save()?;
-        }
-        Ok(changed)
+            Ok((changed, changed))
+        })
     }
 
     /// Persist that the automatic pairing prompt has been shown. A device may
@@ -182,39 +173,39 @@ impl TrustStore {
     /// reinstall; neither should keep interrupting the user. Manual discovery
     /// remains available for every untrusted identity.
     pub fn mark_pairing_prompted(&mut self, discovered: &DeviceInfo) -> io::Result<bool> {
-        let already_prompted = self.devices.iter().any(|device| {
-            device.trust_state == TrustState::Pending
-                && device.name == discovered.name
-                && device.platform == discovered.platform
-        });
-        if already_prompted {
-            return Ok(false);
-        }
+        self.with_latest_devices(|devices| {
+            let already_prompted = devices.iter().any(|device| {
+                device.trust_state == TrustState::Pending
+                    && device.name == discovered.name
+                    && device.platform == discovered.platform
+            });
+            if already_prompted {
+                return Ok((false, false));
+            }
 
-        let Some(index) = find_existing_device_index(&self.devices, discovered) else {
-            return Ok(false);
-        };
-        if self.devices[index].trust_state != TrustState::Discovered {
-            return Ok(false);
-        }
+            let Some(index) = find_existing_device_index(devices, discovered) else {
+                return Ok((false, false));
+            };
+            if devices[index].trust_state != TrustState::Discovered {
+                return Ok((false, false));
+            }
 
-        self.devices[index].trust_state = TrustState::Pending;
-        self.save()?;
-        Ok(true)
+            devices[index].trust_state = TrustState::Pending;
+            Ok((true, true))
+        })
     }
 
     pub fn revoke(&mut self, id: &DeviceId) -> io::Result<bool> {
-        let mut changed = false;
-        for device in &mut self.devices {
-            if &device.id == id {
-                device.trust_state = TrustState::Revoked;
-                changed = true;
+        self.with_latest_devices(|devices| {
+            let mut changed = false;
+            for device in devices {
+                if &device.id == id {
+                    device.trust_state = TrustState::Revoked;
+                    changed = true;
+                }
             }
-        }
-        if changed {
-            self.save()?;
-        }
-        Ok(changed)
+            Ok((changed, changed))
+        })
     }
 
     pub fn update_endpoint_and_key(
@@ -223,60 +214,130 @@ impl TrustStore {
         endpoint: String,
         public_key: String,
     ) -> io::Result<bool> {
-        let Some(device) = self.devices.iter_mut().find(|device| {
-            device.trust_state == TrustState::Trusted
-                && (&device.id == id || device.public_key.as_deref() == Some(public_key.as_str()))
-        }) else {
-            return Ok(false);
-        };
+        self.with_latest_devices(move |devices| {
+            let Some(device) = devices.iter_mut().find(|device| {
+                device.trust_state == TrustState::Trusted
+                    && (&device.id == id
+                        || device.public_key.as_deref() == Some(public_key.as_str()))
+            }) else {
+                return Ok((false, false));
+            };
 
-        let mut changed = false;
+            let mut changed = false;
 
-        if device.endpoint.as_deref() != Some(endpoint.as_str()) {
-            device.endpoint = Some(endpoint);
-            changed = true;
-        }
-
-        match device.public_key.as_deref() {
-            None => {
-                device.public_key = Some(public_key);
+            if device.endpoint.as_deref() != Some(endpoint.as_str()) {
+                device.endpoint = Some(endpoint);
                 changed = true;
             }
-            Some(existing) if existing == public_key => {}
-            Some(_) => {
-                return Ok(false);
-            }
-        }
 
-        if changed {
-            self.save()?;
-        }
-        Ok(changed)
+            match device.public_key.as_deref() {
+                None => {
+                    device.public_key = Some(public_key);
+                    changed = true;
+                }
+                Some(existing) if existing == public_key => {}
+                Some(_) => {
+                    return Ok((false, false));
+                }
+            }
+
+            Ok((changed, changed))
+        })
     }
 
     pub fn reset(&mut self) -> io::Result<()> {
-        self.devices.clear();
-        self.save()
+        self.with_latest_devices(|devices| {
+            devices.clear();
+            Ok(((), true))
+        })
     }
 
     pub fn compact(&mut self) -> io::Result<bool> {
-        let before = self.devices.clone();
-        normalize_devices(&mut self.devices);
-        let changed = self.devices != before;
-        if changed {
-            self.save()?;
-        }
-        Ok(changed)
+        self.with_latest_devices(|devices| {
+            let before = devices.clone();
+            normalize_devices(devices);
+            let changed = *devices != before;
+            Ok((changed, changed))
+        })
     }
 
-    fn save(&self) -> io::Result<()> {
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let mut file = fs::File::create(&self.path)?;
-        file.write_all(serialize_devices(&self.devices).as_bytes())?;
-        file.sync_all()
+    fn with_latest_devices<T>(
+        &mut self,
+        operation: impl FnOnce(&mut Vec<DeviceInfo>) -> io::Result<(T, bool)>,
+    ) -> io::Result<T> {
+        let path = self.path.clone();
+        with_exclusive_lock(&path, || {
+            self.devices = read_devices_unlocked(&path)?;
+            let (result, should_save) = operation(&mut self.devices)?;
+            if should_save {
+                save_devices_unlocked(&path, &self.devices)?;
+            }
+            Ok(result)
+        })
     }
+}
+
+fn read_devices_unlocked(path: &Path) -> io::Result<Vec<DeviceInfo>> {
+    match fs::read_to_string(path) {
+        Ok(contents) => Ok(parse_devices(&contents)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(error),
+    }
+}
+
+fn save_devices_unlocked(path: &Path, devices: &[DeviceInfo]) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = fs::File::create(path)?;
+    file.write_all(serialize_devices(devices).as_bytes())?;
+    file.sync_all()
+}
+
+fn with_shared_lock<T>(path: &Path, operation: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
+    with_lock(path, false, operation)
+}
+
+fn with_exclusive_lock<T>(path: &Path, operation: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
+    with_lock(path, true, operation)
+}
+
+fn with_lock<T>(
+    path: &Path,
+    exclusive: bool,
+    operation: impl FnOnce() -> io::Result<T>,
+) -> io::Result<T> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let lock_path = lock_path(path);
+    let lock_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path)?;
+    if exclusive {
+        FileExt::lock_exclusive(&lock_file)?;
+    } else {
+        FileExt::lock_shared(&lock_file)?;
+    }
+
+    let result = operation();
+    let unlock_result = FileExt::unlock(&lock_file);
+    match result {
+        Ok(value) => {
+            unlock_result?;
+            Ok(value)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn lock_path(path: &Path) -> PathBuf {
+    let mut value = OsString::from(path.as_os_str());
+    value.push(".lock");
+    PathBuf::from(value)
 }
 
 fn parse_devices(value: &str) -> Vec<DeviceInfo> {
@@ -861,6 +922,52 @@ mod tests {
         assert!(raw.contains("new-phone"));
 
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn stale_store_cannot_overwrite_a_concurrent_revoke() {
+        let path = temp_file("concurrent-revoke.tsv");
+        let _ = fs::remove_file(&path);
+        let trusted_id = DeviceId::new("trusted-before-revoke").unwrap();
+
+        let mut setup = TrustStore::load(&path).unwrap();
+        setup
+            .trust(
+                trusted_id.clone(),
+                "MacBook".to_string(),
+                Platform::MacOs,
+                Some("192.168.1.2".to_string()),
+                Some("aa".repeat(32)),
+            )
+            .unwrap();
+
+        let mut revoking_process = TrustStore::load(&path).unwrap();
+        let mut stale_daemon_snapshot = TrustStore::load(&path).unwrap();
+        assert!(revoking_process.revoke(&trusted_id).unwrap());
+        stale_daemon_snapshot
+            .record_discovered(DeviceInfo {
+                id: DeviceId::new("new-device").unwrap(),
+                name: "Windows PC".to_string(),
+                platform: Platform::Windows,
+                trust_state: TrustState::Discovered,
+                endpoint: Some("192.168.1.3".to_string()),
+                public_key: Some("bb".repeat(32)),
+            })
+            .unwrap();
+
+        let reloaded = TrustStore::load(&path).unwrap();
+        assert_eq!(
+            reloaded.device(&trusted_id).unwrap().trust_state,
+            TrustState::Revoked
+        );
+        assert!(
+            reloaded
+                .device(&DeviceId::new("new-device").unwrap())
+                .is_some()
+        );
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(lock_path(&path));
     }
 
     fn temp_file(name: &str) -> PathBuf {
