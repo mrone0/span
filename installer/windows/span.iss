@@ -40,7 +40,7 @@ Name: "{group}\Span"; Filename: "{app}\span-gui.exe"
 Name: "{autodesktop}\Span"; Filename: "{app}\span-gui.exe"; Tasks: desktopicon
 
 [Run]
-Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM span.exe"; Flags: runhidden waituntilterminated ignoreerrors
+Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM span.exe"; Flags: runhidden waituntilterminated
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""Span Discovery (UDP-In)"""; Flags: runhidden waituntilterminated
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""Span Discovery UI (UDP-In)"""; Flags: runhidden waituntilterminated
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""Span Clipboard (TCP-In)"""; Flags: runhidden waituntilterminated
@@ -52,7 +52,7 @@ Filename: "{app}\span-gui.exe"; Description: "启动 Span"; Flags: runasoriginal
 
 [UninstallRun]
 Filename: "{app}\span.exe"; Parameters: "uninstall"; Flags: runhidden waituntilterminated skipifdoesntexist
-Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM span.exe"; Flags: runhidden waituntilterminated ignoreerrors
+Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM span.exe"; Flags: runhidden waituntilterminated
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""Span Discovery (UDP-In)"""; Flags: runhidden waituntilterminated
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""Span Discovery UI (UDP-In)"""; Flags: runhidden waituntilterminated
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""Span Clipboard (TCP-In)"""; Flags: runhidden waituntilterminated
