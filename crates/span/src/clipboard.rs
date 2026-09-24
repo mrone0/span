@@ -250,11 +250,12 @@ fn windows_read_text() -> io::Result<Option<String>> {
 
 #[cfg(target_os = "windows")]
 fn windows_write_text(text: &str) -> io::Result<()> {
+    use windows_sys::Win32::Foundation::GlobalFree;
     use windows_sys::Win32::System::DataExchange::{
         CloseClipboard, EmptyClipboard, SetClipboardData,
     };
     use windows_sys::Win32::System::Memory::{
-        GMEM_MOVEABLE, GlobalAlloc, GlobalFree, GlobalLock, GlobalUnlock,
+        GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock,
     };
     use windows_sys::Win32::System::Ole::CF_UNICODETEXT;
 
