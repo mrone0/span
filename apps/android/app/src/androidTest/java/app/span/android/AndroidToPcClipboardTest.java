@@ -9,7 +9,6 @@ import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.Intent;
 import android.os.Build;
-import androidx.lifecycle.Lifecycle;
 import androidx.test.core.app.ActivityScenario;
 import androidx.test.ext.junit.runners.AndroidJUnit4;
 import androidx.test.platform.app.InstrumentationRegistry;
@@ -70,25 +69,26 @@ public final class AndroidToPcClipboardTest {
         context.getSharedPreferences("span", Context.MODE_PRIVATE).edit().clear().commit();
     }
 
-    @Test public void foregroundWakeAutomaticallySendsCurrentClipboardTwice() throws Exception {
+    @Test public void explicitSendActionSendsCurrentClipboardTwice() throws Exception {
         try (ActivityScenario<MainActivity> activity = ActivityScenario.launch(MainActivity.class)) {
             // MainActivity starts the production receiver on 46793. Stop only that
             // listener so this test's fake PC can own the same production port.
             context.stopService(new Intent(context, SpanReceiveService.class));
             waitUntilTextPortCanBind();
 
-            assertClipboardSentAfterWake(activity, "Android clipboard A ✓");
-            assertClipboardSentAfterWake(activity, "Android clipboard B ✓");
+            assertClipboardSentExplicitly(activity, "Android clipboard A ✓");
+            assertClipboardSentExplicitly(activity, "Android clipboard B ✓");
         }
     }
 
-    private void assertClipboardSentAfterWake(
+    private void assertClipboardSentExplicitly(
             ActivityScenario<MainActivity> activity, String expected) throws Exception {
-        activity.moveToState(Lifecycle.State.CREATED);
-        ClipboardManager clipboard =
-                (ClipboardManager) context.getSystemService(Context.CLIPBOARD_SERVICE);
-        assertNotNull(clipboard);
-        clipboard.setPrimaryClip(ClipData.newPlainText("test", expected));
+        activity.onActivity(current -> {
+            ClipboardManager clipboard =
+                    (ClipboardManager) current.getSystemService(Context.CLIPBOARD_SERVICE);
+            assertNotNull(clipboard);
+            clipboard.setPrimaryClip(ClipData.newPlainText("test", expected));
+        });
 
         try (ServerSocket server = new ServerSocket()) {
             server.setReuseAddress(true);
@@ -98,7 +98,7 @@ public final class AndroidToPcClipboardTest {
             Thread receiver = new Thread(received, "fake-span-pc");
             receiver.start();
 
-            activity.moveToState(Lifecycle.State.RESUMED);
+            activity.onActivity(MainActivity::sendCurrentClipboard);
             assertEquals(expected, received.get(6, TimeUnit.SECONDS));
         }
     }

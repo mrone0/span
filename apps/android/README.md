@@ -59,7 +59,11 @@ apps/android/app/build/outputs/apk/debug/app-debug.apk
 apps/android/app/build/outputs/apk/release/app-release.apk
 ```
 
-本机实测体积：debug 约 67K，R8 + 资源压缩后的 release debug-signed 约 40K，可直接侧载安装。注意它使用 Android debug key 自动签名，仅用于测试/开源预览，不适合 Play Store 或正式分发。
+本机实测体积：debug 约 67K，R8 + 资源压缩后的本地 release 约 40K。本机构建在没有提供发布密钥时使用当前电脑的 Android debug key，仅用于开发验证，不能作为可升级的正式安装包。
+
+GitHub tag 发布使用仓库 Secrets 中的固定 Android keystore，产物名为 `span-android-release.apk`；`versionName` 来自 tag，`versionCode` 随 Release workflow 递增。固定签名是覆盖升级的前提，不能把 keystore 提交到仓库。
+
+`v0.1.2-test.34` 及更早测试包使用的是 CI 临时 debug 证书，因此首次切换到固定签名版不能直接覆盖安装。请先卸载旧 APK（Android 会同时清除旧配对和设置），再安装新的 `span-android-release.apk` 并重新配对；之后的固定签名版本可以正常覆盖升级。
 
 `local.properties` 只用于本机 Android SDK 路径，已加入根目录 `.gitignore`。
 
@@ -98,4 +102,8 @@ Android 端在 Devices 列表中点击 PC 的 **Trust**。手动配对时需要�
 1. 安装 JDK 21 和 Android 36 SDK；
 2. 运行 JVM 单元测试；
 3. 构建 debug 和 release APK；
-4. 上传 `span-android-apks` artifact，其中同时包含 debug APK 和 release debug-signed APK。
+4. 上传 `span-android-apks` artifact，其中包含仅供 CI 验证的 debug APK 和本地 debug-key 签名的压缩 APK。
+
+tag Release 的正式 APK 由 `.github/workflows/release.yml` 单独构建；若稳定签名 Secrets 缺失、证书指纹不匹配或 Android 模拟器集成测试失败，整个 Release 都会停止，不再创建缺少 APK 或无法覆盖升级的版本。公开 Release 只附加正式签名 APK，debug APK 仅保留在普通 Android CI artifact 中。
+
+`.github/workflows/android-test.yml` 会分别在 Android 10（API 29）、Android 15（API 35）和 Android 16（API 36）模拟器上运行集成测试。除普通 instrumentation 外，它还会启用真实无障碍服务，在另一个测试 App 保持前台时验证 PC → Android 写入及 Android → PC 发送，并确认整个过程不会打开 Span 界面。

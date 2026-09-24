@@ -1,6 +1,7 @@
 package app.span.android;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 
 import android.Manifest;
@@ -44,14 +45,21 @@ public final class PcToAndroidClipboardTest {
                     + "fc3060f3fd4b43b430dcaceb6d87b4b4";
     private static final String EXPECTED = "Rust PC to Android clipboard ✓";
     private static final String SECOND_EXPECTED = "Second PC clipboard update ✓";
+    private static final String LOCAL_AFTER_REMOTE = "User clipboard must remain local ✓";
+    private static final String BASELINE = "span-test-baseline";
 
     private Context context;
     private Context testContext;
     private final AtomicReference<String> probedClipboard = new AtomicReference<>();
 
-    @Before public void setUp() {
+    @Before public void setUp() throws Exception {
         context = InstrumentationRegistry.getInstrumentation().getTargetContext();
         testContext = InstrumentationRegistry.getInstrumentation().getContext();
+        context.stopService(new Intent(context, SpanReceiveService.class));
+        long stopDeadline = System.currentTimeMillis() + 2000;
+        while (SpanReceiveService.isRunning() && System.currentTimeMillis() < stopDeadline) {
+            Thread.sleep(25);
+        }
         probedClipboard.set(null);
         context.getSharedPreferences("span", Context.MODE_PRIVATE).edit()
                 .clear()
@@ -102,17 +110,39 @@ public final class PcToAndroidClipboardTest {
             launchForegroundClipboardProbe();
             probedClipboard.set(null);
             sendRawPacketWithRetry(fixedRustPacket());
-            // Span stays in the background while another app reads the result.
-            assertClipboardEventuallyEquals(EXPECTED);
+            // Android 10+ may accept or silently defer a background clipboard
+            // write. Keep it durable until a focused Span window or the
+            // accessibility overlay can verify the exact value.
+            assertPendingEventuallyEquals(EXPECTED);
+            closeForegroundProbe();
+            activity.moveToState(Lifecycle.State.RESUMED);
+            assertActivityClipboardEventuallyEquals(activity, EXPECTED);
+            assertPendingEventuallyCleared();
+            assertEquals(
+                    "received clipboard text must not be echoed to its sender",
+                    0,
+                    SpanClipboardSync.sendCapturedClipboard(context, EXPECTED));
+
+            // Simulate the user copying something in the foreground app after
+            // the PC update. Bringing Span back must not replay the old pending
+            // value over this newer local clipboard.
+            setClipboardFromForegroundProbe(LOCAL_AFTER_REMOTE);
+            closeForegroundProbe();
+            activity.moveToState(Lifecycle.State.RESUMED);
+            assertActivityClipboardEventuallyEquals(activity, LOCAL_AFTER_REMOTE);
 
             activity.moveToState(Lifecycle.State.CREATED);
+            launchForegroundClipboardProbe();
             // A fresh encrypted packet exercises the production receive path a
             // second time, guarding against the observed "first copy only" bug.
             SpanCrypto.Encrypted second = SpanCrypto.encryptText(
                     SECOND_EXPECTED, ANDROID_PRIVATE, PC_PUBLIC);
             probedClipboard.set(null);
             sendRawPacketWithRetry(packetLine(second.nonceHex, second.ciphertextHex));
-            assertClipboardEventuallyEquals(SECOND_EXPECTED);
+            assertPendingEventuallyEquals(SECOND_EXPECTED);
+            closeForegroundProbe();
+            activity.moveToState(Lifecycle.State.RESUMED);
+            assertActivityClipboardEventuallyEquals(activity, SECOND_EXPECTED);
         }
     }
 
@@ -120,7 +150,7 @@ public final class PcToAndroidClipboardTest {
         ClipboardManager clipboard =
                 (ClipboardManager) activity.getSystemService(Context.CLIPBOARD_SERVICE);
         assertNotNull(clipboard);
-        clipboard.setPrimaryClip(ClipData.newPlainText("test baseline", "span-test-baseline"));
+        clipboard.setPrimaryClip(ClipData.newPlainText("test baseline", BASELINE));
     }
 
     private String fixedRustPacket() {
@@ -156,15 +186,11 @@ public final class PcToAndroidClipboardTest {
         Intent intent = new Intent();
         intent.setComponent(new ComponentName(
                 testContext.getPackageName(), ClipboardProbeActivity.class.getName()));
-        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK
+                | Intent.FLAG_ACTIVITY_CLEAR_TOP
+                | Intent.FLAG_ACTIVITY_SINGLE_TOP);
         intent.putExtra(ClipboardProbeActivity.EXTRA_FINISH_ON_VALUE, SECOND_EXPECTED);
-        intent.putExtra(ClipboardProbeActivity.EXTRA_RESULT_RECEIVER, new ResultReceiver(null) {
-            @Override protected void onReceiveResult(int resultCode, Bundle resultData) {
-                if (resultCode == ClipboardProbeActivity.RESULT_CLIPBOARD && resultData != null) {
-                    probedClipboard.set(resultData.getString(ClipboardProbeActivity.EXTRA_VALUE));
-                }
-            }
-        });
+        intent.putExtra(ClipboardProbeActivity.EXTRA_RESULT_RECEIVER, clipboardResultReceiver());
         testContext.startActivity(intent);
         try {
             Thread.sleep(500);
@@ -172,6 +198,62 @@ public final class PcToAndroidClipboardTest {
             Thread.currentThread().interrupt();
             throw new AssertionError("interrupted while launching clipboard probe", error);
         }
+    }
+
+    private void setClipboardFromForegroundProbe(String value) throws Exception {
+        probedClipboard.set(null);
+        Intent intent = new Intent();
+        intent.setComponent(new ComponentName(
+                testContext.getPackageName(), ClipboardProbeActivity.class.getName()));
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK
+                | Intent.FLAG_ACTIVITY_CLEAR_TOP
+                | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+        intent.putExtra(ClipboardProbeActivity.EXTRA_SET_VALUE, value);
+        intent.putExtra(ClipboardProbeActivity.EXTRA_RESULT_RECEIVER, clipboardResultReceiver());
+        testContext.startActivity(intent);
+        assertClipboardEventuallyEquals(value);
+    }
+
+    private ResultReceiver clipboardResultReceiver() {
+        return new ResultReceiver(null) {
+            @Override protected void onReceiveResult(int resultCode, Bundle resultData) {
+                if (resultCode == ClipboardProbeActivity.RESULT_CLIPBOARD && resultData != null) {
+                    probedClipboard.set(resultData.getString(ClipboardProbeActivity.EXTRA_VALUE));
+                }
+            }
+        };
+    }
+
+    private void closeForegroundProbe() throws Exception {
+        Intent intent = new Intent();
+        intent.setComponent(new ComponentName(
+                testContext.getPackageName(), ClipboardProbeActivity.class.getName()));
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK
+                | Intent.FLAG_ACTIVITY_CLEAR_TOP
+                | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+        intent.putExtra(ClipboardProbeActivity.EXTRA_FINISH_NOW, true);
+        testContext.startActivity(intent);
+        Thread.sleep(250);
+    }
+
+    private void assertActivityClipboardEventuallyEquals(
+            ActivityScenario<MainActivity> activity, String expected) throws Exception {
+        AtomicReference<String> actual = new AtomicReference<>();
+        long deadline = System.currentTimeMillis() + 5000;
+        while (System.currentTimeMillis() < deadline) {
+            activity.onActivity(current -> {
+                ClipboardManager clipboard = (ClipboardManager)
+                        current.getSystemService(Context.CLIPBOARD_SERVICE);
+                if (clipboard == null || !clipboard.hasPrimaryClip()) return;
+                ClipData clip = clipboard.getPrimaryClip();
+                if (clip == null || clip.getItemCount() == 0) return;
+                CharSequence value = clip.getItemAt(0).coerceToText(current);
+                actual.set(value == null ? null : value.toString());
+            });
+            if (expected.equals(actual.get())) return;
+            Thread.sleep(100);
+        }
+        assertEquals(expected, actual.get());
     }
 
     private void assertClipboardEventuallyEquals(String expected) throws Exception {
@@ -183,5 +265,28 @@ public final class PcToAndroidClipboardTest {
             Thread.sleep(100);
         }
         assertEquals(expected, actual);
+    }
+
+    private void assertPendingEventuallyEquals(String expected) throws Exception {
+        long deadline = System.currentTimeMillis() + 5000;
+        String actual = null;
+        while (System.currentTimeMillis() < deadline) {
+            actual = context.getSharedPreferences("span", Context.MODE_PRIVATE)
+                    .getString("clipboard.pending_remote_text", null);
+            if (expected.equals(actual)) return;
+            Thread.sleep(50);
+        }
+        assertEquals(expected, actual);
+    }
+
+    private void assertPendingEventuallyCleared() throws Exception {
+        long deadline = System.currentTimeMillis() + 5000;
+        while (System.currentTimeMillis() < deadline) {
+            if (!context.getSharedPreferences("span", Context.MODE_PRIVATE)
+                    .contains("clipboard.pending_remote_text")) return;
+            Thread.sleep(50);
+        }
+        assertFalse(context.getSharedPreferences("span", Context.MODE_PRIVATE)
+                .contains("clipboard.pending_remote_text"));
     }
 }

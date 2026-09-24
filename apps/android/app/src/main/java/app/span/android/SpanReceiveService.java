@@ -20,11 +20,13 @@ import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 
 public final class SpanReceiveService extends Service {
     private static final String TAG = "SpanReceiveService";
     static final String ACTION_START = "app.span.android.action.START_RECEIVER";
     static final String ACTION_STOP = "app.span.android.action.STOP_RECEIVER";
+    static final String ACTION_DISCOVER = "app.span.android.action.DISCOVER";
     static final String ACTION_SEND_CLIPBOARD = "app.span.android.action.SEND_CLIPBOARD";
     private static final String CHANNEL_ID = "span-transfer";
     private static final int NOTIFICATION_ID = 46793;
@@ -32,6 +34,7 @@ public final class SpanReceiveService extends Service {
     private static final int MAX_PACKET_BYTES = (SpanProtocol.MAX_TEXT_BYTES + 32) * 2 + 256;
 
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
+    private final ExecutorService pairingExecutor = Executors.newSingleThreadExecutor();
     private volatile boolean running;
     private ServerSocket serverSocket;
     private LocalIdentity identity;
@@ -42,7 +45,15 @@ public final class SpanReceiveService extends Service {
     static boolean isRunning() { return serviceRunning; }
 
     static void start(Context context) {
-        Intent intent = new Intent(context, SpanReceiveService.class).setAction(ACTION_START);
+        startWithAction(context, ACTION_START);
+    }
+
+    static void discover(Context context) {
+        startWithAction(context, ACTION_DISCOVER);
+    }
+
+    private static void startWithAction(Context context, String action) {
+        Intent intent = new Intent(context, SpanReceiveService.class).setAction(action);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             context.startForegroundService(intent);
         } else {
@@ -65,7 +76,7 @@ public final class SpanReceiveService extends Service {
             stopSelf();
         }
         if (identity != null) {
-            discovery = new SpanDiscovery(this, identity, device -> store.upsertDiscovered(device));
+            discovery = new SpanDiscovery(this, identity, this::handleDiscovered);
         }
         createNotificationChannel();
     }
@@ -83,6 +94,9 @@ public final class SpanReceiveService extends Service {
             return START_STICKY;
         }
         startDiscovery();
+        if (intent != null && ACTION_DISCOVER.equals(intent.getAction()) && discovery != null) {
+            discovery.announceOnce();
+        }
         if (!running && identity != null) {
             running = true;
             executor.execute(this::listenLoop);
@@ -98,6 +112,7 @@ public final class SpanReceiveService extends Service {
         }
         stopDiscovery();
         executor.shutdownNow();
+        pairingExecutor.shutdownNow();
         super.onDestroy();
     }
 
@@ -119,6 +134,28 @@ public final class SpanReceiveService extends Service {
         try {
             if (discovery != null) discovery.destroy();
         } catch (Exception ignored) {
+        }
+    }
+
+    private void handleDiscovered(SpanDevice device) {
+        store.upsertDiscovered(device);
+        SpanDevice trusted = store.trustedDevice(device.id);
+        if (trusted == null || pairingExecutor.isShutdown()) return;
+        // Repeat the encrypted acknowledgement whenever a trusted peer is seen.
+        // This repairs a one-sided pairing if the first TCP acknowledgement was
+        // lost while the desktop was offline, without reviving revoked devices.
+        try {
+            pairingExecutor.execute(() -> {
+                try {
+                    new SpanTransport().sendPairingAccept(identity, trusted);
+                } catch (Exception error) {
+                    Log.d(TAG, "Could not refresh reciprocal pairing for "
+                            + shortId(trusted.id), error);
+                }
+            });
+        } catch (RejectedExecutionException ignored) {
+            // The service can be destroyed between the isShutdown check and
+            // enqueueing this best-effort reciprocal acknowledgement.
         }
     }
 
@@ -164,14 +201,33 @@ public final class SpanReceiveService extends Service {
         }
         Log.i(TAG, "Packet received from " + shortId(packet.fromDeviceId));
 
-        SpanDevice sender = store.trustedDevice(packet.fromDeviceId);
+        SpanDevice sender = store.device(packet.fromDeviceId);
         if (sender == null || sender.publicKeyHex == null || sender.publicKeyHex.trim().isEmpty()) {
-            Log.w(TAG, "Packet rejected from untrusted sender " + shortId(packet.fromDeviceId));
+            Log.w(TAG, "Packet rejected from unknown sender " + shortId(packet.fromDeviceId));
+            return;
+        }
+        if (packet.kind == SpanTextPacket.Kind.TEXT && !sender.trusted) {
+            Log.w(TAG, "Text rejected from untrusted sender " + shortId(packet.fromDeviceId));
             return;
         }
 
         try {
             String text = SpanCrypto.decryptText(packet, identity.privateKeyHex, sender.publicKeyHex);
+            if (packet.kind == SpanTextPacket.Kind.PAIRING_ACCEPT) {
+                if (!SpanProtocol.PAIRING_ACCEPT_PROOF.equals(text)) {
+                    Log.w(TAG, "Pairing proof rejected from " + shortId(packet.fromDeviceId));
+                    return;
+                }
+                if (store.acceptPairing(packet.fromDeviceId, sender.publicKeyHex)) {
+                    Log.i(TAG, "Pairing accepted by " + shortId(packet.fromDeviceId));
+                } else {
+                    // Revoked devices deliberately land here. A delayed accept
+                    // packet must never undo an explicit local removal.
+                    Log.w(TAG, "Pairing accept ignored for current trust state from "
+                            + shortId(packet.fromDeviceId));
+                }
+                return;
+            }
             byte[] utf8 = text.getBytes(StandardCharsets.UTF_8);
             if (utf8.length > SpanProtocol.MAX_TEXT_BYTES) {
                 Log.w(TAG, "Decrypted text exceeds limit from " + shortId(packet.fromDeviceId));

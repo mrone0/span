@@ -18,8 +18,27 @@ public final class SpanTextPacketTest {
 
         SpanTextPacket packet = SpanTextPacket.parse(line);
         assertNotNull(packet);
+        assertEquals(SpanTextPacket.Kind.TEXT, packet.kind);
         assertEquals(sender.id, packet.fromDeviceId);
         assertEquals(text, SpanCrypto.decryptText(packet, receiver.privateKeyHex, sender.publicKeyHex));
+    }
+
+    @Test public void desktopPairingAcceptPacketRoundTrips() throws Exception {
+        LocalIdentity desktop = SpanCrypto.createIdentity("desktop");
+        LocalIdentity android = SpanCrypto.createIdentity("android");
+        SpanCrypto.Encrypted encrypted = SpanCrypto.encryptText(
+                SpanProtocol.PAIRING_ACCEPT_PROOF,
+                desktop.privateKeyHex,
+                android.publicKeyHex);
+        String line = SpanProtocol.PAIRING_ACCEPT_MAGIC + "\t" + desktop.id + "\t"
+                + encrypted.nonceHex + "\t" + encrypted.ciphertextHex + "\n";
+
+        SpanTextPacket packet = SpanTextPacket.parse(line);
+        assertNotNull(packet);
+        assertEquals(SpanTextPacket.Kind.PAIRING_ACCEPT, packet.kind);
+        assertEquals(
+                SpanProtocol.PAIRING_ACCEPT_PROOF,
+                SpanCrypto.decryptText(packet, android.privateKeyHex, desktop.publicKeyHex));
     }
 
     @Test public void malformedPacketsAreRejected() {

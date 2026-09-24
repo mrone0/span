@@ -11,10 +11,26 @@ final class SpanTransport {
         if (text.getBytes(StandardCharsets.UTF_8).length > SpanProtocol.MAX_TEXT_BYTES) {
             throw new IllegalArgumentException("text too large");
         }
+        sendEncrypted(SpanProtocol.TEXT_MAGIC, text, identity, device);
+    }
+
+    void sendPairingAccept(LocalIdentity identity, SpanDevice device) throws Exception {
+        sendEncrypted(
+                SpanProtocol.PAIRING_ACCEPT_MAGIC,
+                SpanProtocol.PAIRING_ACCEPT_PROOF,
+                identity,
+                device);
+    }
+
+    private void sendEncrypted(
+            String magic, String plaintext, LocalIdentity identity, SpanDevice device)
+            throws Exception {
         if (device.host == null || device.host.trim().isEmpty()) throw new IllegalArgumentException("missing host");
         if (device.publicKeyHex == null || device.publicKeyHex.trim().isEmpty()) throw new IllegalArgumentException("missing key");
-        SpanCrypto.Encrypted encrypted = SpanCrypto.encryptText(text, identity.privateKeyHex, device.publicKeyHex);
-        String line = SpanProtocol.TEXT_MAGIC + "\t" + identity.id + "\t" + encrypted.nonceHex + "\t" + encrypted.ciphertextHex + "\n";
+        SpanCrypto.Encrypted encrypted = SpanCrypto.encryptText(
+                plaintext, identity.privateKeyHex, device.publicKeyHex);
+        String line = magic + "\t" + identity.id + "\t" + encrypted.nonceHex + "\t"
+                + encrypted.ciphertextHex + "\n";
         byte[] data = line.getBytes(StandardCharsets.UTF_8);
         try (Socket socket = new Socket()) {
             socket.connect(new InetSocketAddress(device.host, SpanProtocol.TEXT_PORT), 2500);

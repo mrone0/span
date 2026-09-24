@@ -37,7 +37,7 @@ jobs:
       - name: Test and build APKs
         run: |
           cd apps/android
-          ./gradlew :app:testDebugUnitTest :app:assembleDebug :app:assembleRelease
+          ./gradlew :app:lintDebug :app:testDebugUnitTest :app:assembleDebug :app:assembleRelease
 
       - name: Upload APK artifacts
         uses: actions/upload-artifact@v4

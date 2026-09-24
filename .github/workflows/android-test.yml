@@ -16,9 +16,13 @@ permissions:
 
 jobs:
   bidirectional-clipboard:
-    name: Android bidirectional clipboard (emulator)
+    name: Android bidirectional clipboard (API ${{ matrix.api-level }})
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        api-level: [29, 35, 36]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -39,10 +43,16 @@ jobs:
       - name: Run bidirectional clipboard integration tests
         uses: reactivecircus/android-emulator-runner@v2
         with:
-          api-level: 35
+          api-level: ${{ matrix.api-level }}
           arch: x86_64
           profile: pixel_2
           disable-animations: true
           emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
           working-directory: apps/android
-          script: ./gradlew :app:connectedDebugAndroidTest
+          script: |
+            ./gradlew :app:connectedDebugAndroidTest :app:assembleRelease
+            ./scripts/accessibility-clipboard-smoke.sh
+            adb uninstall app.span.android || true
+            adb install app/build/outputs/apk/release/app-release.apk
+            adb shell am start -W -n app.span.android/.MainActivity
+            adb shell pidof app.span.android

@@ -7,6 +7,8 @@ apps/android/local.properties
 apps/android/.gradle/
 apps/android/build/
 apps/android/app/build/
+*.jks
+*.keystore
 
 # Local npm package tarballs
 /npm/span-desktop/*.tgz

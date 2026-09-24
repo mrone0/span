@@ -11,6 +11,7 @@ PC 端不要求用户本地构建，直接用 GitHub Actions 产物。当前第�
 - `span-windows-x64-setup.exe`：Windows 标准安装器，自动安装后台同步、开始菜单快捷方式，并放行局域网发现与文本同步端口
 - `span-windows-x64.zip`：便携版，只包含 `span.exe` 和 `span-gui.exe`
 - `span-linux-x64.tar.gz`：只包含 `span` 和 `span-gui`；Linux 当前 GUI 会提示暂不支持
+- `span-android-release.apk`：使用固定 Android 发布密钥签名，可覆盖升级
 
 触发方式：
 
@@ -20,6 +21,22 @@ git push origin v0.1.0
 ```
 
 也可以在 GitHub Actions 页面手动点 `workflow_dispatch`。
+
+### Android 固定签名
+
+Android 覆盖升级要求每个版本使用同一把签名密钥。密钥只保存在 GitHub Actions Secrets，不能提交到仓库。首次发布前生成并离线备份 keystore，然后配置：
+
+```text
+ANDROID_KEYSTORE_BASE64
+ANDROID_KEYSTORE_PASSWORD
+ANDROID_KEY_ALIAS
+ANDROID_KEY_PASSWORD
+ANDROID_SIGNING_CERT_SHA256
+```
+
+其中 `ANDROID_KEYSTORE_BASE64` 是 keystore 文件的单行 Base64 内容，`ANDROID_SIGNING_CERT_SHA256` 是发布证书的 64 位十六进制 SHA-256 指纹。Release workflow 会先跑 Android 模拟器双向剪贴板测试，再构建并核对最终 APK 的证书；缺少任一项、指纹不匹配或测试失败时，整个 GitHub Release 和 npm 发布都会停止。tag 会写入 `versionName`，workflow run number 会生成单调递增的 `versionCode`。
+
+`v0.1.2-test.34` 及更早 Android 测试包使用了 CI 临时 debug 证书。首次迁移到固定签名版时必须卸载旧 APK（旧配对和设置会被清除）并重新安装、配对；此后只要 keystore 和证书指纹保持不变，就可以直接覆盖升级。
 
 ## 包内容
 

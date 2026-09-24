@@ -210,6 +210,7 @@ jobs:
   android-apk:
     name: Build android-apk
     runs-on: ubuntu-latest
+    timeout-minutes: 35
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -230,29 +231,106 @@ jobs:
           yes | "$SDKMANAGER" --licenses >/dev/null || true
           "$SDKMANAGER" --install 'platforms;android-36' 'build-tools;36.0.0'
 
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Run Android integration gate
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          arch: x86_64
+          profile: pixel_2
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          working-directory: apps/android
+          script: |
+            ./gradlew :app:connectedDebugAndroidTest
+            ./scripts/accessibility-clipboard-smoke.sh
+
+      - name: Configure stable Android release signing
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          SPAN_ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          SPAN_ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          SPAN_ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          ANDROID_SIGNING_CERT_SHA256: ${{ secrets.ANDROID_SIGNING_CERT_SHA256 }}
+        run: |
+          for name in \
+            ANDROID_KEYSTORE_BASE64 \
+            SPAN_ANDROID_KEYSTORE_PASSWORD \
+            SPAN_ANDROID_KEY_ALIAS \
+            SPAN_ANDROID_KEY_PASSWORD \
+            ANDROID_SIGNING_CERT_SHA256; do
+            if [ -z "${!name}" ]; then
+              echo "Missing required Android signing secret: $name" >&2
+              exit 1
+            fi
+          done
+          KEYSTORE_PATH="$RUNNER_TEMP/span-release.jks"
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$KEYSTORE_PATH"
+          echo "SPAN_ANDROID_KEYSTORE_FILE=$KEYSTORE_PATH" >> "$GITHUB_ENV"
+
       - name: Test and build APKs
+        env:
+          SPAN_ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          SPAN_ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          SPAN_ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
           cd apps/android
-          ./gradlew :app:testDebugUnitTest :app:assembleDebug :app:assembleRelease
+          VERSION_NAME="${GITHUB_REF_NAME#v}"
+          VERSION_CODE="$((10000 + GITHUB_RUN_NUMBER))"
+          ./gradlew \
+            :app:lintDebug \
+            :app:testDebugUnitTest \
+            :app:assembleDebug \
+            :app:assembleRelease \
+            -PspanVersionName="$VERSION_NAME" \
+            -PspanVersionCode="$VERSION_CODE"
+
+      - name: Verify Android signing certificate
+        shell: bash
+        env:
+          ANDROID_SIGNING_CERT_SHA256: ${{ secrets.ANDROID_SIGNING_CERT_SHA256 }}
+        run: |
+          APKSIGNER="$ANDROID_SDK_ROOT/build-tools/36.0.0/apksigner"
+          if [ ! -x "$APKSIGNER" ]; then
+            APKSIGNER="$ANDROID_HOME/build-tools/36.0.0/apksigner"
+          fi
+          APK="apps/android/app/build/outputs/apk/release/app-release.apk"
+          EXPECTED="$(printf '%s' "$ANDROID_SIGNING_CERT_SHA256" \
+            | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]:' )"
+          ACTUAL="$("$APKSIGNER" verify --print-certs "$APK" \
+            | sed -n 's/^Signer #1 certificate SHA-256 digest: //p' \
+            | head -n 1 | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]:' )"
+          if [[ ! "$EXPECTED" =~ ^[0-9a-f]{64}$ || "$ACTUAL" != "$EXPECTED" ]]; then
+            echo "Android signing certificate fingerprint mismatch: $ACTUAL" >&2
+            exit 1
+          fi
+
+      - name: Remove temporary Android keystore
+        if: always()
+        run: rm -f "$RUNNER_TEMP/span-release.jks"
 
       - name: Stage Android artifacts
         run: |
           mkdir -p dist
-          cp apps/android/app/build/outputs/apk/debug/app-debug.apk dist/span-android-debug.apk
-          cp apps/android/app/build/outputs/apk/release/app-release.apk dist/span-android-release-debug-signed.apk
+          cp apps/android/app/build/outputs/apk/release/app-release.apk dist/span-android-release.apk
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: android-apk
-          path: |
-            dist/span-android-debug.apk
-            dist/span-android-release-debug-signed.apk
+          path: dist/span-android-release.apk
 
   create-release:
     name: Create GitHub Release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: build
+    needs: [build, android-apk]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -264,6 +342,12 @@ jobs:
           pattern: 'desktop-*'
           merge-multiple: true
 
+      - name: Download Android release artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: android-apk
+          path: dist
+
       - name: List release assets
         run: find dist -maxdepth 2 -type f -print | sort
 
@@ -271,27 +355,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*
-          fail_on_unmatched_files: true
-
-  attach-android-release-assets:
-    name: Attach Android APKs to Release
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: [android-apk, create-release]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - name: Download Android artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: android-apk
-          path: dist
-
-      - name: Attach Android APKs
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.ref_name }}
-          files: dist/*.apk
           fail_on_unmatched_files: true
 
   publish-npm:

@@ -43,9 +43,15 @@ public final class MainActivity extends Activity {
 
     private SpanStore store;
     private LocalIdentity identity;
-    private SpanDiscovery discovery;
     private final ExecutorService worker = Executors.newCachedThreadPool();
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private final Runnable deviceRefresh = new Runnable() {
+        @Override public void run() {
+            if (isFinishing()) return;
+            refreshDevices();
+            mainHandler.postDelayed(this, 1000);
+        }
+    };
 
     private TextView connectionTitle;
     private TextView connectionDetail;
@@ -71,16 +77,8 @@ public final class MainActivity extends Activity {
         } catch (Exception error) {
             throw new RuntimeException(error);
         }
-        discovery = new SpanDiscovery(this, identity, device -> {
-            store.upsertDiscovered(device);
-            runOnUiThread(() -> {
-                refreshDevices();
-                showActivity("发现了 " + safeName(device.name) + "，确认后即可连接");
-            });
-        });
         buildUi();
         store.setReceiverEnabled(true);
-        discovery.start();
         SpanReceiveService.start(this);
         refreshDevices();
         handleLaunchIntent(getIntent());
@@ -96,30 +94,27 @@ public final class MainActivity extends Activity {
         super.onResume();
         updateBackgroundSetup();
         refreshDevices();
+        mainHandler.removeCallbacks(deviceRefresh);
+        mainHandler.postDelayed(deviceRefresh, 500);
         if (!isFinishing()) SpanClipboardSync.writePendingRemoteClipboard(this);
+    }
+
+    @Override protected void onPause() {
+        mainHandler.removeCallbacks(deviceRefresh);
+        super.onPause();
     }
 
     @Override public void onWindowFocusChanged(boolean hasFocus) {
         super.onWindowFocusChanged(hasFocus);
-        if (!hasFocus || isFinishing() || worker.isShutdown()) return;
-        if (SpanClipboardSync.writePendingRemoteClipboard(this)) return;
-        worker.execute(this::sendClipboardAfterWake);
-    }
-
-    private void sendClipboardAfterWake() {
-        try {
-            int sent = SpanClipboardSync.sendCurrentClipboard(this);
-            if (sent > 0) runOnUiThread(() -> showActivity("已发送到 " + sent + " 台可信设备"));
-        } catch (SecurityException error) {
-            runOnUiThread(() -> showActivity("点击“发送当前剪贴板”重试"));
-        } catch (Exception error) {
-            runOnUiThread(() -> showActivity("发送失败，请检查可信设备是否在线"));
-        }
+        if (!hasFocus || isFinishing()) return;
+        // A focused Activity may read back and verify a deferred remote write.
+        // Never treat merely opening Span as permission to transmit the user's
+        // current clipboard; sending remains an explicit button/share/tile action.
+        SpanClipboardSync.writePendingRemoteClipboard(this);
     }
 
     @Override protected void onDestroy() {
         mainHandler.removeCallbacksAndMessages(null);
-        discovery.destroy();
         worker.shutdownNow();
         super.onDestroy();
     }
@@ -277,7 +272,7 @@ public final class MainActivity extends Activity {
     private void discoverNearby() {
         discoverButton.setEnabled(false);
         discoverButton.setText("查找中…");
-        discovery.announceOnce();
+        SpanReceiveService.discover(this);
         showActivity("正在查找同一局域网内的设备…");
         mainHandler.postDelayed(() -> {
             if (isFinishing()) return;
@@ -327,13 +322,41 @@ public final class MainActivity extends Activity {
         content.addView(copy, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1));
         Button trust = smallPrimaryButton("信任");
         trust.setOnClickListener(v -> {
-            store.setTrusted(device.id, true);
+            if (!store.setTrusted(device.id, true)) {
+                showActivity("设备状态已变化，请重新发现");
+                refreshDevices();
+                return;
+            }
             showActivity("已连接 " + safeName(device.name));
             refreshDevices();
+            worker.execute(() -> notifyPeerPairingAccepted(device));
         });
         content.addView(trust, new LinearLayout.LayoutParams(dp(74), dp(40)));
         row.addView(content);
         return row;
+    }
+
+    private void notifyPeerPairingAccepted(SpanDevice device) {
+        for (int attempt = 0; attempt < 3; attempt++) {
+            try {
+                new SpanTransport().sendPairingAccept(identity, device);
+                runOnUiThread(() -> showActivity(
+                        "已与 " + safeName(device.name) + " 完成双向信任"));
+                return;
+            } catch (Exception error) {
+                if (attempt < 2) {
+                    try {
+                        Thread.sleep(250L * (attempt + 1));
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                        return;
+                    }
+                }
+            }
+        }
+        // Local trust remains explicit and valid even when the reciprocal
+        // confirmation cannot reach a desktop that just went offline.
+        runOnUiThread(() -> showActivity("已在手机信任；请确认电脑端 Span 在线"));
     }
 
     private View trustedRow(SpanDevice device) {
@@ -429,7 +452,7 @@ public final class MainActivity extends Activity {
         }
     }
 
-    private void sendCurrentClipboard() {
+    void sendCurrentClipboard() {
         sendButton.setEnabled(false);
         sendButton.setText("正在发送…");
         worker.execute(() -> {

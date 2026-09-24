@@ -1,5 +1,19 @@
 plugins { id 'com.android.application' }
 
+def spanVersionCode = providers.gradleProperty('spanVersionCode').orElse('13').get().toInteger()
+def spanVersionName = providers.gradleProperty('spanVersionName').orElse('0.1.2-dev').get()
+def releaseKeystorePath = System.getenv('SPAN_ANDROID_KEYSTORE_FILE')
+def releaseKeystorePassword = System.getenv('SPAN_ANDROID_KEYSTORE_PASSWORD')
+def releaseKeyAlias = System.getenv('SPAN_ANDROID_KEY_ALIAS')
+def releaseKeyPassword = System.getenv('SPAN_ANDROID_KEY_PASSWORD')
+def hasReleaseSigning = [
+        releaseKeystorePath,
+        releaseKeystorePassword,
+        releaseKeyAlias,
+        releaseKeyPassword,
+].every { value -> value != null && !value.trim().isEmpty() } &&
+        file(releaseKeystorePath ?: 'missing-release-keystore').isFile()
+
 android {
     namespace 'app.span.android'
     compileSdk 36
@@ -8,8 +22,8 @@ android {
         applicationId 'app.span.android'
         minSdk 29
         targetSdk 36
-        versionCode 12
-        versionName '0.1.11'
+        versionCode spanVersionCode
+        versionName spanVersionName
         testInstrumentationRunner 'androidx.test.runner.AndroidJUnitRunner'
     }
 
@@ -18,14 +32,23 @@ android {
         targetCompatibility JavaVersion.VERSION_17
     }
 
+    signingConfigs {
+        release {
+            if (hasReleaseSigning) {
+                storeFile file(releaseKeystorePath)
+                storePassword releaseKeystorePassword
+                keyAlias releaseKeyAlias
+                keyPassword releaseKeyPassword
+            }
+        }
+    }
+
     buildTypes {
         release {
-            // Testing/open-source convenience: sign release APK with the standard
-            // Android debug key so GitHub Actions can produce an installable APK
-            // without storing a private release keystore in the repository.
-            // Replace this with a real signingConfig backed by GitHub Secrets
-            // before Play Store or production distribution.
-            signingConfig signingConfigs.debug
+            // Local preview builds remain installable with the developer's debug
+            // key. Tagged GitHub releases provide the stable release credentials
+            // above and fail in the workflow before Gradle when they are missing.
+            signingConfig hasReleaseSigning ? signingConfigs.release : signingConfigs.debug
             minifyEnabled true
             shrinkResources true
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'

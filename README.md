@@ -54,6 +54,7 @@ flowchart LR
 - `docs/release.md`：GitHub Actions 发布说明
 - `apps/android`：Android V1 App（双向文本、剪贴板一键发送 / 分享菜单 / Quick Settings Tile / 接收服务）
 - `apps/android/README.md`：Android 构建、配对和限制
+- `apps/android/docs/background-setup`：Android 无障碍、后台保活及各厂商设置说明
 - `docs/mobile-ios-plan.md`：暂缓的 iOS 方案草稿（当前不参与 V1）
 
 ## npm 安装（桌面端）
@@ -89,6 +90,9 @@ GitHub Actions 的桌面压缩包现在只放最小可运行内容，不再塞 R
 - macOS：压缩包里只有 `Span.app`，用户双击即可打开 GUI
 - Windows：优先下载 `span-windows-x64-setup.exe` 标准安装器；另保留含 `span-gui.exe` 和 `span.exe` 的免安装 zip
 - Linux：只有 `span` 和 `span-gui`
+- Android：普通用户下载固定发布密钥签名的 `span-android-release.apk`；`span-android-debug.apk` 仅用于调试
+
+> 从 `v0.1.2-test.34` 或更早的 Android 测试包迁移时，需要先卸载旧 APK，再安装首个固定签名版本并重新配对。旧测试包使用了临时 debug 证书，Android 不允许直接覆盖为新的正式证书；完成这一次迁移后，后续正式版本即可直接覆盖升级。
 
 保留两个桌面二进制是为了同时满足：GUI 双击不弹终端、CLI/daemon 仍可被脚本和自启动调用。
 
@@ -123,6 +127,15 @@ span send [文本]          # 发送文本；省略文本时发送当前剪贴�
 ## Android 端
 
 Android V1 支持 Android → PC 主动发送，也支持 PC → Android 接收并写入系统剪贴板；手机端不做后台剪贴板读取监听。详见 [`apps/android/README.md`](apps/android/README.md)。
+
+首次安装后请按 [`Android 无障碍与后台设置总览`](apps/android/docs/background-setup/README.md) 完成通知、无障碍和电池优化设置。各厂商的详细入口：
+
+- [小米 / Redmi（HyperOS、MIUI）](apps/android/docs/background-setup/xiaomi-redmi.md)
+- [OPPO / 一加 / realme（ColorOS）](apps/android/docs/background-setup/oppo-oneplus-realme.md)
+- [华为（HarmonyOS、EMUI）](apps/android/docs/background-setup/huawei.md)
+- [荣耀（MagicOS）](apps/android/docs/background-setup/honor.md)
+- [vivo / iQOO（OriginOS、Funtouch OS）](apps/android/docs/background-setup/vivo-iqoo.md)
+- [三星（One UI）](apps/android/docs/background-setup/samsung.md)
 
 ```sh
 cd apps/android
