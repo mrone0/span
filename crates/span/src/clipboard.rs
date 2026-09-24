@@ -81,7 +81,10 @@ impl WindowsClipboardListener {
 #[cfg(target_os = "windows")]
 impl Clipboard for WindowsClipboard {
     fn change_count(&mut self) -> io::Result<Option<u64>> {
-        Ok(None)
+        use windows_sys::Win32::System::DataExchange::GetClipboardSequenceNumber;
+
+        let sequence = unsafe { GetClipboardSequenceNumber() };
+        Ok((sequence != 0).then_some(u64::from(sequence)))
     }
 
     fn wait_for_change(&mut self, timeout: Duration) -> io::Result<bool> {
@@ -206,7 +209,7 @@ fn windows_read_text() -> io::Result<Option<String>> {
     use std::ffi::c_void;
 
     use windows_sys::Win32::System::DataExchange::{
-        CloseClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
+        CloseClipboard, GetClipboardData, IsClipboardFormatAvailable,
     };
     use windows_sys::Win32::System::Memory::{GlobalLock, GlobalUnlock};
     use windows_sys::Win32::System::Ole::CF_UNICODETEXT;
@@ -215,9 +218,7 @@ fn windows_read_text() -> io::Result<Option<String>> {
         if IsClipboardFormatAvailable(u32::from(CF_UNICODETEXT)) == 0 {
             return Ok(None);
         }
-        if OpenClipboard(std::ptr::null_mut()) == 0 {
-            return Err(io::Error::last_os_error());
-        }
+        windows_open_clipboard_with_retry()?;
 
         let result = (|| {
             let handle = GetClipboardData(u32::from(CF_UNICODETEXT));
@@ -250,10 +251,10 @@ fn windows_read_text() -> io::Result<Option<String>> {
 #[cfg(target_os = "windows")]
 fn windows_write_text(text: &str) -> io::Result<()> {
     use windows_sys::Win32::System::DataExchange::{
-        CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+        CloseClipboard, EmptyClipboard, SetClipboardData,
     };
     use windows_sys::Win32::System::Memory::{
-        GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock,
+        GMEM_MOVEABLE, GlobalAlloc, GlobalFree, GlobalLock, GlobalUnlock,
     };
     use windows_sys::Win32::System::Ole::CF_UNICODETEXT;
 
@@ -262,38 +263,70 @@ fn windows_write_text(text: &str) -> io::Result<()> {
     let byte_len = utf16.len() * std::mem::size_of::<u16>();
 
     unsafe {
-        if OpenClipboard(std::ptr::null_mut()) == 0 {
+        // Prepare the replacement before emptying the system clipboard. An
+        // allocation or encoding failure must leave the user's current Copy
+        // operation untouched.
+        let handle = GlobalAlloc(GMEM_MOVEABLE, byte_len);
+        if handle.is_null() {
             return Err(io::Error::last_os_error());
         }
 
+        let pointer = GlobalLock(handle) as *mut u16;
+        if pointer.is_null() {
+            let error = io::Error::last_os_error();
+            GlobalFree(handle);
+            return Err(error);
+        }
+
+        std::ptr::copy_nonoverlapping(utf16.as_ptr(), pointer, utf16.len());
+        GlobalUnlock(handle);
+
+        if let Err(error) = windows_open_clipboard_with_retry() {
+            GlobalFree(handle);
+            return Err(error);
+        }
+
+        let mut ownership_transferred = false;
         let result = (|| {
             if EmptyClipboard() == 0 {
                 return Err(io::Error::last_os_error());
             }
 
-            let handle = GlobalAlloc(GMEM_MOVEABLE, byte_len);
-            if handle.is_null() {
-                return Err(io::Error::last_os_error());
-            }
-
-            let pointer = GlobalLock(handle) as *mut u16;
-            if pointer.is_null() {
-                return Err(io::Error::last_os_error());
-            }
-
-            std::ptr::copy_nonoverlapping(utf16.as_ptr(), pointer, utf16.len());
-            GlobalUnlock(handle);
-
             if SetClipboardData(u32::from(CF_UNICODETEXT), handle).is_null() {
                 return Err(io::Error::last_os_error());
             }
 
+            ownership_transferred = true;
             Ok(())
         })();
 
         CloseClipboard();
+        if !ownership_transferred {
+            GlobalFree(handle);
+        }
         result
     }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_open_clipboard_with_retry() -> io::Result<()> {
+    use windows_sys::Win32::System::DataExchange::OpenClipboard;
+
+    let mut last_error = None;
+    for attempt in 0..8_u64 {
+        if unsafe { OpenClipboard(std::ptr::null_mut()) } != 0 {
+            return Ok(());
+        }
+        last_error = Some(io::Error::last_os_error());
+        if attempt < 7 {
+            // Copy providers such as Office and browsers can own the clipboard
+            // briefly while rendering formats. Back off instead of fighting
+            // that normal operation or dropping the synchronized update.
+            std::thread::sleep(Duration::from_millis(5 * (attempt + 1)));
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| io::Error::other("clipboard unavailable")))
 }
 
 #[cfg(target_os = "macos")]

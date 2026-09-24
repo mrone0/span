@@ -11,12 +11,12 @@ mod trust_store;
 use std::io;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use fs2::FileExt;
 use span_core::{DeviceId, TrustState, broadcast_targets};
 
-use crate::clipboard::system_clipboard;
+use crate::clipboard::{Clipboard, system_clipboard};
 use crate::config::{
     LocalDevice, gui_executable_path, load_or_create_local_device, parse_platform, platform_name,
     trust_store_path,
@@ -33,6 +33,42 @@ use crate::transport::{
 use crate::trust_store::TrustStore;
 
 const PAIRING_ACCEPT_TEXT: &str = "\0SPAN_PAIR_ACCEPT_V1\0";
+const REMOTE_CLIPBOARD_SUPPRESSION_TTL: Duration = Duration::from_secs(5);
+
+#[derive(Default)]
+struct ClipboardEchoGuard {
+    pending: Option<RemoteClipboardMarker>,
+}
+
+struct RemoteClipboardMarker {
+    text: String,
+    expires_at: Instant,
+}
+
+impl ClipboardEchoGuard {
+    fn arm(&mut self, text: &str) {
+        self.pending = Some(RemoteClipboardMarker {
+            text: text.to_string(),
+            expires_at: Instant::now() + REMOTE_CLIPBOARD_SUPPRESSION_TTL,
+        });
+    }
+
+    fn cancel(&mut self, text: &str) {
+        if self.pending.as_ref().map(|marker| marker.text.as_str()) == Some(text) {
+            self.pending = None;
+        }
+    }
+
+    fn should_suppress(&mut self, text: &str) -> bool {
+        // Consume the marker even on a mismatch. If the user copies something
+        // else before the remote write notification is observed, that local
+        // copy must win and a stale marker must never suppress a future copy.
+        let Some(marker) = self.pending.take() else {
+            return false;
+        };
+        marker.expires_at >= Instant::now() && marker.text == text
+    }
+}
 
 pub fn run() -> io::Result<()> {
     let mut args = std::env::args().skip(1);
@@ -112,7 +148,7 @@ fn run_daemon() -> io::Result<()> {
     let local = load_or_create_local_device()?;
     let store_path = trust_store_path()?;
     let store = TrustStore::load(&store_path)?;
-    let suppressed_text = Arc::new(Mutex::new(None::<String>));
+    let clipboard_echo_guard = Arc::new(Mutex::new(ClipboardEchoGuard::default()));
     let latest_pending_text = Arc::new(Mutex::new(None::<String>));
 
     println!("span daemon");
@@ -122,7 +158,7 @@ fn run_daemon() -> io::Result<()> {
     println!("targets: {} trusted", store.trusted_devices().len());
     println!("listen : 0.0.0.0:{TEXT_PORT}");
 
-    spawn_receiver(local.clone(), suppressed_text.clone());
+    spawn_receiver(local.clone(), clipboard_echo_guard.clone());
     spawn_discovery_listener(
         store_path.clone(),
         local.clone(),
@@ -157,9 +193,10 @@ fn run_daemon() -> io::Result<()> {
 
         match clipboard.change_count() {
             Ok(Some(change_count)) if last_change_count == Some(change_count) => {
-                if !change_was_reported && !forced_clipboard_check {
-                    continue;
-                }
+                // Native sequence counters are authoritative. Do not open and
+                // read the clipboard on a timer when nothing changed; on busy
+                // Windows apps that needless polling can contend with Copy.
+                continue;
             }
             Ok(Some(change_count)) => {
                 last_change_count = Some(change_count);
@@ -175,8 +212,7 @@ fn run_daemon() -> io::Result<()> {
                     continue;
                 }
                 last_seen_text = Some(text.clone());
-                if should_suppress(&suppressed_text, &text) {
-                    thread::sleep(Duration::from_millis(350));
+                if should_suppress(&clipboard_echo_guard, &text) {
                     continue;
                 }
                 broadcast_clipboard_text(&store_path, &local, latest_pending_text.clone(), text)?;
@@ -333,7 +369,7 @@ fn detach_gui_command(command: &mut std::process::Command) {
     command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW | DETACHED_PROCESS);
 }
 
-fn spawn_receiver(local: LocalDevice, suppressed_text: Arc<Mutex<Option<String>>>) {
+fn spawn_receiver(local: LocalDevice, clipboard_echo_guard: Arc<Mutex<ClipboardEchoGuard>>) {
     thread::spawn(move || {
         let trust_path = match trust_store_path() {
             Ok(path) => path,
@@ -377,10 +413,7 @@ fn spawn_receiver(local: LocalDevice, suppressed_text: Arc<Mutex<Option<String>>
                 }
 
                 let mut clipboard = system_clipboard();
-                clipboard.write_text(&text)?;
-                if let Ok(mut suppressed) = suppressed_text.lock() {
-                    *suppressed = Some(text);
-                }
+                write_remote_clipboard(&mut *clipboard, &clipboard_echo_guard, &text)?;
                 println!("received text from {}", packet.from);
                 Ok(())
             }) {
@@ -423,16 +456,122 @@ fn send_pairing_accept_to(local: &LocalDevice, device: &span_core::DeviceInfo) -
     send_text((endpoint, TEXT_PORT), &packet)
 }
 
-fn should_suppress(suppressed_text: &Arc<Mutex<Option<String>>>, text: &str) -> bool {
-    let Ok(mut suppressed) = suppressed_text.lock() else {
+fn should_suppress(guard: &Arc<Mutex<ClipboardEchoGuard>>, text: &str) -> bool {
+    let Ok(mut guard) = guard.lock() else {
         return false;
     };
 
-    if suppressed.as_deref() == Some(text) {
-        *suppressed = None;
-        true
-    } else {
-        false
+    guard.should_suppress(text)
+}
+
+fn write_remote_clipboard(
+    clipboard: &mut dyn Clipboard,
+    guard: &Arc<Mutex<ClipboardEchoGuard>>,
+    text: &str,
+) -> io::Result<bool> {
+    // A reflected packet with the same plain text must not rewrite the local
+    // clipboard. On Windows/macOS that would discard rich-text, image and app-
+    // specific formats even though the visible text did not change.
+    if clipboard.read_text().ok().flatten().as_deref() == Some(text) {
+        return Ok(false);
+    }
+
+    // Arm before touching the platform clipboard. Windows can deliver
+    // WM_CLIPBOARDUPDATE immediately, before write_text returns.
+    if let Ok(mut guard) = guard.lock() {
+        guard.arm(text);
+    }
+
+    if let Err(error) = clipboard.write_text(text) {
+        if let Ok(mut guard) = guard.lock() {
+            guard.cancel(text);
+        }
+        return Err(error);
+    }
+
+    Ok(true)
+}
+
+#[cfg(test)]
+mod clipboard_echo_tests {
+    use super::*;
+
+    struct TestClipboard {
+        text: Option<String>,
+        writes: usize,
+        fail_write: bool,
+        observe_guard_on_write: Option<Arc<Mutex<ClipboardEchoGuard>>>,
+        saw_armed_guard: bool,
+    }
+
+    impl TestClipboard {
+        fn with_text(text: Option<&str>) -> Self {
+            Self {
+                text: text.map(str::to_string),
+                writes: 0,
+                fail_write: false,
+                observe_guard_on_write: None,
+                saw_armed_guard: false,
+            }
+        }
+    }
+
+    impl Clipboard for TestClipboard {
+        fn read_text(&mut self) -> io::Result<Option<String>> {
+            Ok(self.text.clone())
+        }
+
+        fn write_text(&mut self, text: &str) -> io::Result<()> {
+            self.writes += 1;
+            if let Some(guard) = self.observe_guard_on_write.clone() {
+                self.saw_armed_guard = should_suppress(&guard, text);
+            }
+            if self.fail_write {
+                return Err(io::Error::other("simulated clipboard failure"));
+            }
+            self.text = Some(text.to_string());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn remote_marker_is_armed_before_platform_write_returns() {
+        let guard = Arc::new(Mutex::new(ClipboardEchoGuard::default()));
+        let mut clipboard = TestClipboard::with_text(Some("local"));
+        clipboard.observe_guard_on_write = Some(guard.clone());
+
+        assert!(write_remote_clipboard(&mut clipboard, &guard, "remote").unwrap());
+        assert!(clipboard.saw_armed_guard);
+        assert!(!should_suppress(&guard, "remote"));
+    }
+
+    #[test]
+    fn reflected_same_text_does_not_destroy_existing_clipboard_formats() {
+        let guard = Arc::new(Mutex::new(ClipboardEchoGuard::default()));
+        let mut clipboard = TestClipboard::with_text(Some("same visible text"));
+
+        assert!(!write_remote_clipboard(&mut clipboard, &guard, "same visible text").unwrap());
+        assert_eq!(clipboard.writes, 0);
+        assert!(!should_suppress(&guard, "same visible text"));
+    }
+
+    #[test]
+    fn unrelated_local_copy_consumes_stale_remote_marker() {
+        let guard = Arc::new(Mutex::new(ClipboardEchoGuard::default()));
+        guard.lock().unwrap().arm("remote");
+
+        assert!(!should_suppress(&guard, "new local copy"));
+        assert!(!should_suppress(&guard, "remote"));
+    }
+
+    #[test]
+    fn failed_platform_write_cancels_remote_marker() {
+        let guard = Arc::new(Mutex::new(ClipboardEchoGuard::default()));
+        let mut clipboard = TestClipboard::with_text(Some("local"));
+        clipboard.fail_write = true;
+
+        assert!(write_remote_clipboard(&mut clipboard, &guard, "remote").is_err());
+        assert!(!should_suppress(&guard, "remote"));
     }
 }
 
