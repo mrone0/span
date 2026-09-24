@@ -34,7 +34,18 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Test workspace
-        run: cargo test --workspace
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --workspace 2>&1 | tee cargo-test.log
+
+      - name: Publish cargo failure details
+        if: failure()
+        shell: bash
+        run: |
+          MESSAGE="$(tail -n 35 cargo-test.log 2>/dev/null | tr '\r\n' '  ')"
+          MESSAGE="${MESSAGE//'%'/'%25'}"
+          echo "::error title=Desktop cargo test failed::$MESSAGE"
 
       - name: Check all targets
         run: cargo check --workspace --all-targets
