@@ -3,10 +3,12 @@ package app.span.android;
 import android.accessibilityservice.AccessibilityButtonController;
 import android.accessibilityservice.AccessibilityService;
 import android.accessibilityservice.AccessibilityServiceInfo;
+import android.content.ComponentName;
 import android.content.Context;
 import android.graphics.PixelFormat;
 import android.os.Handler;
 import android.os.Looper;
+import android.provider.Settings;
 import android.view.Gravity;
 import android.view.View;
 import android.view.WindowManager;
@@ -300,15 +302,29 @@ public final class SpanKeepAliveService extends AccessibilityService {
     static boolean isEnabled(Context context) {
         AccessibilityManager manager =
                 (AccessibilityManager) context.getSystemService(Context.ACCESSIBILITY_SERVICE);
-        if (manager == null) return false;
-        List<android.accessibilityservice.AccessibilityServiceInfo> enabled =
-                manager.getEnabledAccessibilityServiceList(AccessibilityServiceInfo.FEEDBACK_ALL_MASK);
-        String packageName = context.getPackageName();
-        String className = SpanKeepAliveService.class.getName();
-        for (android.accessibilityservice.AccessibilityServiceInfo info : enabled) {
-            if (info.getResolveInfo() == null || info.getResolveInfo().serviceInfo == null) continue;
-            android.content.pm.ServiceInfo service = info.getResolveInfo().serviceInfo;
-            if (packageName.equals(service.packageName) && className.equals(service.name)) return true;
+        if (manager != null) {
+            List<android.accessibilityservice.AccessibilityServiceInfo> enabled =
+                    manager.getEnabledAccessibilityServiceList(AccessibilityServiceInfo.FEEDBACK_ALL_MASK);
+            String packageName = context.getPackageName();
+            String className = SpanKeepAliveService.class.getName();
+            for (android.accessibilityservice.AccessibilityServiceInfo info : enabled) {
+                if (info.getResolveInfo() == null || info.getResolveInfo().serviceInfo == null) continue;
+                android.content.pm.ServiceInfo service = info.getResolveInfo().serviceInfo;
+                if (packageName.equals(service.packageName) && className.equals(service.name)) return true;
+            }
+        }
+        // Vendor ROMs, Huawei EMUI in particular, sometimes keep the service in
+        // the enabled-services secure setting while the manager query above
+        // reports an empty list, so the raw setting is the source of truth.
+        String setting = Settings.Secure.getString(
+                context.getContentResolver(), Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES);
+        if (setting == null) return false;
+        ComponentName component = new ComponentName(context, SpanKeepAliveService.class);
+        String full = component.flattenToString();
+        String shorthand = component.flattenToShortString();
+        for (String entry : setting.split(":")) {
+            entry = entry.trim();
+            if (full.equalsIgnoreCase(entry) || shorthand.equalsIgnoreCase(entry)) return true;
         }
         return false;
     }
