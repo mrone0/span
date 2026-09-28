@@ -92,7 +92,7 @@ GitHub Actions 的桌面压缩包现在只放最小可运行内容，不再塞 R
 - Linux：只有 `span` 和 `span-gui`
 - Android：普通用户下载固定发布密钥签名的 `span-android-release.apk`；`span-android-debug.apk` 仅用于调试
 
-> 从 `v0.1.2-test.34` 或更早的 Android 测试包迁移时，需要先卸载旧 APK，再安装首个固定签名版本并重新配对。旧测试包使用了临时 debug 证书，Android 不允许直接覆盖为新的正式证书；完成这一次迁移后，后续正式版本即可直接覆盖升级。
+> 从 `v0.1.2-test.37` 及更早的 Android 测试包迁移时，需要先卸载旧 APK，再安装首个固定签名版本并重新配对。旧测试包用的是 CI 临时 debug 证书或上一把 keystore，Android 不允许直接覆盖为新的签名；完成这一次迁移后，Release 产物、`android-apk` CI 产物和本机构建共用同一签名，可直接覆盖升级。
 
 保留两个桌面二进制是为了同时满足：GUI 双击不弹终端、CLI/daemon 仍可被脚本和自启动调用。
 

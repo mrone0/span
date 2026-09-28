@@ -34,10 +34,74 @@ jobs:
           yes | "$SDKMANAGER" --licenses >/dev/null || true
           "$SDKMANAGER" --install 'platforms;android-36' 'build-tools;36.0.0'
 
+      # CI artifacts must carry the same key as tagged releases, otherwise every
+      # install forces a uninstall/re-pair cycle on the phone.
+      - name: Configure stable Android signing
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          SPAN_ANDROID_KEYSTORE_PASSWORD: ${{ secrets.SPAN_ANDROID_KEYSTORE_PASSWORD }}
+          SPAN_ANDROID_KEY_ALIAS: ${{ secrets.SPAN_ANDROID_KEY_ALIAS }}
+          SPAN_ANDROID_KEY_PASSWORD: ${{ secrets.SPAN_ANDROID_KEY_PASSWORD }}
+        run: |
+          if [ -z "$ANDROID_KEYSTORE_BASE64" ] || [ -z "$SPAN_ANDROID_KEYSTORE_PASSWORD" ] \
+             || [ -z "$SPAN_ANDROID_KEY_ALIAS" ] || [ -z "$SPAN_ANDROID_KEY_PASSWORD" ]; then
+            echo "WARNING: Android signing secrets are not configured;" >&2
+            echo "these APKs fall back to the ephemeral runner debug key and cannot" >&2
+            echo "be installed as an update over a previous build." >&2
+            echo "SPAN_ANDROID_RELEASE_SIGNED=0" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          KEYSTORE_PATH="$RUNNER_TEMP/span-ci.jks"
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$KEYSTORE_PATH"
+          echo "SPAN_ANDROID_KEYSTORE_FILE=$KEYSTORE_PATH" >> "$GITHUB_ENV"
+          echo "SPAN_ANDROID_RELEASE_SIGNED=1" >> "$GITHUB_ENV"
+
       - name: Test and build APKs
+        shell: bash
+        env:
+          SPAN_ANDROID_KEYSTORE_PASSWORD: ${{ secrets.SPAN_ANDROID_KEYSTORE_PASSWORD }}
+          SPAN_ANDROID_KEY_ALIAS: ${{ secrets.SPAN_ANDROID_KEY_ALIAS }}
+          SPAN_ANDROID_KEY_PASSWORD: ${{ secrets.SPAN_ANDROID_KEY_PASSWORD }}
         run: |
           cd apps/android
-          ./gradlew :app:lintDebug :app:testDebugUnitTest :app:assembleDebug :app:assembleRelease
+          # Wall-clock seconds keep versionCode monotonic across this workflow
+          # and the release workflow, so an APK is never a version downgrade.
+          VERSION_CODE="$(date -u +%s)"
+          ./gradlew \
+            :app:lintDebug \
+            :app:testDebugUnitTest \
+            :app:assembleDebug \
+            :app:assembleRelease \
+            -PspanVersionName="0.1.2-ci.$GITHUB_RUN_NUMBER" \
+            -PspanVersionCode="$VERSION_CODE"
+
+      - name: Verify Android signing certificate
+        if: env.SPAN_ANDROID_RELEASE_SIGNED == '1'
+        shell: bash
+        env:
+          ANDROID_SIGNING_CERT_SHA256: ${{ secrets.ANDROID_SIGNING_CERT_SHA256 }}
+        run: |
+          APKSIGNER="$ANDROID_SDK_ROOT/build-tools/36.0.0/apksigner"
+          if [ ! -x "$APKSIGNER" ]; then
+            APKSIGNER="$ANDROID_HOME/build-tools/36.0.0/apksigner"
+          fi
+          for APK in apps/android/app/build/outputs/apk/debug/app-debug.apk \
+                     apps/android/app/build/outputs/apk/release/app-release.apk; do
+            EXPECTED="$(printf '%s' "$ANDROID_SIGNING_CERT_SHA256" \
+              | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]:' )"
+            ACTUAL="$("$APKSIGNER" verify --print-certs "$APK" \
+              | sed -n 's/^Signer #1 certificate SHA-256 digest: //p' \
+              | head -n 1 | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]:' )"
+            if [[ ! "$EXPECTED" =~ ^[0-9a-f]{64}$ || "$ACTUAL" != "$EXPECTED" ]]; then
+              echo "$APK signing certificate fingerprint mismatch: $ACTUAL" >&2
+              exit 1
+            fi
+          done
+
+      - name: Remove temporary keystore
+        if: always()
+        run: rm -f "$RUNNER_TEMP/span-ci.jks"
 
       - name: Upload APK artifacts
         uses: actions/upload-artifact@v4

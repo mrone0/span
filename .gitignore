@@ -7,8 +7,11 @@ apps/android/local.properties
 apps/android/.gradle/
 apps/android/build/
 apps/android/app/build/
+# Local release signing material (keystore + passwords, never commit)
+apps/android/local/
 *.jks
 *.keystore
 
 # Local npm package tarballs
 /npm/span-desktop/*.tgz
+.pi-web/

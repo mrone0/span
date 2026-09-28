@@ -265,7 +265,8 @@ jobs:
           if [ -z "$ANDROID_KEYSTORE_BASE64" ] || [ -z "$SPAN_ANDROID_KEYSTORE_PASSWORD" ] \
              || [ -z "$SPAN_ANDROID_KEY_ALIAS" ] || [ -z "$SPAN_ANDROID_KEY_PASSWORD" ]; then
             echo "WARNING: Android release signing secrets are not configured;" >&2
-            echo "this release falls back to the debug signing key." >&2
+            echo "this release falls back to the ephemeral runner debug key, so it" >&2
+            echo "cannot be installed as an update over a previous release." >&2
             echo "SPAN_ANDROID_RELEASE_SIGNED=0" >> "$GITHUB_ENV"
             exit 0
           fi
@@ -275,14 +276,17 @@ jobs:
           echo "SPAN_ANDROID_RELEASE_SIGNED=1" >> "$GITHUB_ENV"
 
       - name: Test and build APKs
+        shell: bash
         env:
-          SPAN_ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-          SPAN_ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
-          SPAN_ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          SPAN_ANDROID_KEYSTORE_PASSWORD: ${{ secrets.SPAN_ANDROID_KEYSTORE_PASSWORD }}
+          SPAN_ANDROID_KEY_ALIAS: ${{ secrets.SPAN_ANDROID_KEY_ALIAS }}
+          SPAN_ANDROID_KEY_PASSWORD: ${{ secrets.SPAN_ANDROID_KEY_PASSWORD }}
         run: |
           cd apps/android
           VERSION_NAME="${GITHUB_REF_NAME#v}"
-          VERSION_CODE="$((10000 + GITHUB_RUN_NUMBER))"
+          # Wall-clock seconds keep versionCode monotonic across this workflow
+          # and the android-apk workflow, so an APK is never a version downgrade.
+          VERSION_CODE="$(date -u +%s)"
           ./gradlew \
             :app:lintDebug \
             :app:testDebugUnitTest \

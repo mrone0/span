@@ -2,17 +2,44 @@ plugins { id 'com.android.application' }
 
 def spanVersionCode = providers.gradleProperty('spanVersionCode').orElse('13').get().toInteger()
 def spanVersionName = providers.gradleProperty('spanVersionName').orElse('0.1.2-dev').get()
-def releaseKeystorePath = System.getenv('SPAN_ANDROID_KEYSTORE_FILE')
-def releaseKeystorePassword = System.getenv('SPAN_ANDROID_KEYSTORE_PASSWORD')
-def releaseKeyAlias = System.getenv('SPAN_ANDROID_KEY_ALIAS')
-def releaseKeyPassword = System.getenv('SPAN_ANDROID_KEY_PASSWORD')
-def hasReleaseSigning = [
-        releaseKeystorePath,
-        releaseKeystorePassword,
-        releaseKeyAlias,
-        releaseKeyPassword,
-].every { value -> value != null && !value.trim().isEmpty() } &&
-        file(releaseKeystorePath ?: 'missing-release-keystore').isFile()
+
+// Signing credentials come from the CI environment first, then from the
+// gitignored apps/android/local/signing.properties used by local builds.
+// Sharing one key between CI artifacts, tagged releases and local installs is
+// what lets an APK always be installed as an update instead of a reinstall.
+def localSigningFile = new File(rootDir, 'local/signing.properties')
+def localSigning = new Properties()
+if (localSigningFile.isFile()) {
+    localSigningFile.withInputStream { localSigning.load(it) }
+}
+
+def signingValue = { String envName, String propertyName ->
+    def fromEnv = System.getenv(envName)
+    if (fromEnv != null && !fromEnv.trim().isEmpty()) {
+        return fromEnv.trim()
+    }
+    def fromFile = localSigning.getProperty(propertyName)
+    return fromFile == null ? null : fromFile.trim()
+}
+
+def stableKeystorePath = signingValue('SPAN_ANDROID_KEYSTORE_FILE', 'storeFile')
+if (stableKeystorePath != null) {
+    def stableKeystore = new File(stableKeystorePath)
+    if (!stableKeystore.isAbsolute()) {
+        stableKeystore = new File(localSigningFile.parentFile, stableKeystorePath)
+    }
+    stableKeystorePath = stableKeystore.absolutePath
+}
+def stableStorePassword = signingValue('SPAN_ANDROID_KEYSTORE_PASSWORD', 'storePassword')
+def stableKeyAlias = signingValue('SPAN_ANDROID_KEY_ALIAS', 'keyAlias')
+def stableKeyPassword = signingValue('SPAN_ANDROID_KEY_PASSWORD', 'keyPassword')
+def hasStableSigning = [
+        stableKeystorePath,
+        stableStorePassword,
+        stableKeyAlias,
+        stableKeyPassword,
+].every { value -> value != null && !value.isEmpty() } &&
+        new File(stableKeystorePath ?: 'missing-keystore').isFile()
 
 android {
     namespace 'app.span.android'
@@ -33,25 +60,30 @@ android {
     }
 
     signingConfigs {
-        release {
-            if (hasReleaseSigning) {
-                storeFile file(releaseKeystorePath)
-                storePassword releaseKeystorePassword
-                keyAlias releaseKeyAlias
-                keyPassword releaseKeyPassword
+        stable {
+            if (hasStableSigning) {
+                storeFile new File(stableKeystorePath)
+                storePassword stableStorePassword
+                keyAlias stableKeyAlias
+                keyPassword stableKeyPassword
             }
         }
     }
 
     buildTypes {
         release {
-            // Local preview builds remain installable with the developer's debug
-            // key. Tagged GitHub releases provide the stable release credentials
-            // above and fail in the workflow before Gradle when they are missing.
-            signingConfig hasReleaseSigning ? signingConfigs.release : signingConfigs.debug
+            // Without the stable key a local preview build falls back to the
+            // developer's debug key; CI passes the credentials above and then
+            // verifies the certificate fingerprint in the workflow.
+            signingConfig hasStableSigning ? signingConfigs.stable : signingConfigs.debug
             minifyEnabled true
             shrinkResources true
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+        debug {
+            // Debug installs must remain upgradeable over CI builds too, so the
+            // stable key wins whenever it is available on this machine.
+            signingConfig hasStableSigning ? signingConfigs.stable : signingConfigs.debug
         }
     }
 }
