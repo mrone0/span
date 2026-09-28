@@ -258,25 +258,21 @@ jobs:
         shell: bash
         env:
           ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
-          SPAN_ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-          SPAN_ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
-          SPAN_ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
-          ANDROID_SIGNING_CERT_SHA256: ${{ secrets.ANDROID_SIGNING_CERT_SHA256 }}
+          SPAN_ANDROID_KEYSTORE_PASSWORD: ${{ secrets.SPAN_ANDROID_KEYSTORE_PASSWORD }}
+          SPAN_ANDROID_KEY_ALIAS: ${{ secrets.SPAN_ANDROID_KEY_ALIAS }}
+          SPAN_ANDROID_KEY_PASSWORD: ${{ secrets.SPAN_ANDROID_KEY_PASSWORD }}
         run: |
-          for name in \
-            ANDROID_KEYSTORE_BASE64 \
-            SPAN_ANDROID_KEYSTORE_PASSWORD \
-            SPAN_ANDROID_KEY_ALIAS \
-            SPAN_ANDROID_KEY_PASSWORD \
-            ANDROID_SIGNING_CERT_SHA256; do
-            if [ -z "${!name}" ]; then
-              echo "Missing required Android signing secret: $name" >&2
-              exit 1
-            fi
-          done
+          if [ -z "$ANDROID_KEYSTORE_BASE64" ] || [ -z "$SPAN_ANDROID_KEYSTORE_PASSWORD" ] \
+             || [ -z "$SPAN_ANDROID_KEY_ALIAS" ] || [ -z "$SPAN_ANDROID_KEY_PASSWORD" ]; then
+            echo "WARNING: Android release signing secrets are not configured;" >&2
+            echo "this release falls back to the debug signing key." >&2
+            echo "SPAN_ANDROID_RELEASE_SIGNED=0" >> "$GITHUB_ENV"
+            exit 0
+          fi
           KEYSTORE_PATH="$RUNNER_TEMP/span-release.jks"
           printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$KEYSTORE_PATH"
           echo "SPAN_ANDROID_KEYSTORE_FILE=$KEYSTORE_PATH" >> "$GITHUB_ENV"
+          echo "SPAN_ANDROID_RELEASE_SIGNED=1" >> "$GITHUB_ENV"
 
       - name: Test and build APKs
         env:
@@ -296,6 +292,7 @@ jobs:
             -PspanVersionCode="$VERSION_CODE"
 
       - name: Verify Android signing certificate
+        if: env.SPAN_ANDROID_RELEASE_SIGNED == '1'
         shell: bash
         env:
           ANDROID_SIGNING_CERT_SHA256: ${{ secrets.ANDROID_SIGNING_CERT_SHA256 }}
