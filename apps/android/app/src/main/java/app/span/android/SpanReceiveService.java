@@ -87,12 +87,10 @@ public final class SpanReceiveService extends Service {
             return START_NOT_STICKY;
         }
         startForegroundCompat(buildListeningNotification());
-        if (intent != null && ACTION_SEND_CLIPBOARD.equals(intent.getAction())) {
-            if (!SpanKeepAliveService.requestClipboardSend()) {
-                Log.w(TAG, "Clipboard send requested without a connected accessibility service");
-            }
-            return START_STICKY;
-        }
+        // The LAN listener must start for every start request, including the
+        // notification action. Otherwise a process restart that first arrives
+        // through "发送剪贴板" would leave Span silent on port 46793 while it
+        // looks alive to the user.
         startDiscovery();
         if (intent != null && ACTION_DISCOVER.equals(intent.getAction()) && discovery != null) {
             discovery.announceOnce();
@@ -100,6 +98,11 @@ public final class SpanReceiveService extends Service {
         if (!running && identity != null) {
             running = true;
             executor.execute(this::listenLoop);
+        }
+        if (intent != null && ACTION_SEND_CLIPBOARD.equals(intent.getAction())) {
+            if (!SpanKeepAliveService.requestClipboardSend()) {
+                Log.w(TAG, "Clipboard send requested without a connected accessibility service");
+            }
         }
         return START_STICKY;
     }

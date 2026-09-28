@@ -314,16 +314,18 @@ fn windows_open_clipboard_with_retry() -> io::Result<()> {
     use windows_sys::Win32::System::DataExchange::OpenClipboard;
 
     let mut last_error = None;
-    for attempt in 0..8_u64 {
+    for attempt in 0..10_u64 {
         if unsafe { OpenClipboard(std::ptr::null_mut()) } != 0 {
             return Ok(());
         }
         last_error = Some(io::Error::last_os_error());
-        if attempt < 7 {
+        if attempt < 9 {
             // Copy providers such as Office and browsers can own the clipboard
             // briefly while rendering formats. Back off instead of fighting
-            // that normal operation or dropping the synchronized update.
-            std::thread::sleep(Duration::from_millis(5 * (attempt + 1)));
+            // that normal operation or dropping the synchronized update. The
+            // daemon retries the read afterwards, but winning here keeps the
+            // text moving on the same copy the user just made.
+            std::thread::sleep(Duration::from_millis(10 * (attempt + 1)));
         }
     }
 

@@ -79,10 +79,37 @@ pub fn decrypt_text(
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "plaintext is not utf-8"))
 }
 
+/// A peer that vanished from the LAN must not stall the clipboard loop. The
+/// Windows default connect timeout is ~21s, which would freeze every later
+/// copy while one stale endpoint times out.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
 pub fn send_text(addr: impl ToSocketAddrs, packet: &EncryptedTextPacket) -> io::Result<()> {
-    let mut stream = TcpStream::connect(addr)?;
-    stream.set_nodelay(true)?;
-    write_packet(&mut stream, packet)
+    let mut last_error = None;
+    for target in addr.to_socket_addrs()? {
+        let mut stream = match TcpStream::connect_timeout(&target, CONNECT_TIMEOUT) {
+            Ok(stream) => stream,
+            Err(error) => {
+                last_error = Some(error);
+                continue;
+            }
+        };
+
+        if let Err(error) = stream.set_nodelay(true) {
+            last_error = Some(error);
+            continue;
+        }
+        // A peer that accepts and then never reads would otherwise block the
+        // caller for the default socket write timeout.
+        let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
+
+        return write_packet(&mut stream, packet);
+    }
+
+    Err(last_error.unwrap_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "peer resolved to no address")
+    }))
 }
 
 pub fn receive_text_once(timeout: Duration) -> io::Result<Option<EncryptedTextPacket>> {

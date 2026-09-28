@@ -157,6 +157,15 @@ fn run_daemon() -> io::Result<()> {
     println!("policy : broadcast text to trusted devices only");
     println!("targets: {} trusted", store.trusted_devices().len());
     println!("listen : 0.0.0.0:{TEXT_PORT}");
+    for device in store.trusted_devices() {
+        // Make the delivery precondition visible in daemon.log: a trusted
+        // peer without an address can never receive a copied text.
+        println!(
+            "peer   : {} at {}",
+            device.name,
+            device.endpoint.as_deref().unwrap_or("unknown address")
+        );
+    }
 
     spawn_receiver(local.clone(), clipboard_echo_guard.clone());
     spawn_discovery_listener(
@@ -168,14 +177,34 @@ fn run_daemon() -> io::Result<()> {
     let mut clipboard = system_clipboard();
     let mut last_change_count = clipboard.change_count().unwrap_or(None);
     let mut last_seen_text = clipboard.read_text().ok().flatten();
+    let mut clipboard_read_pending = false;
     let mut next_forced_clipboard_check = std::time::Instant::now() + Duration::from_secs(2);
     let mut next_announce = std::time::Instant::now();
+    let mut next_pending_retry = std::time::Instant::now() + Duration::from_secs(15);
 
     loop {
         let now = std::time::Instant::now();
-        if std::time::Instant::now() >= next_announce {
+        if now >= next_announce {
             let _ = broadcast_once(&local);
             next_announce = std::time::Instant::now() + Duration::from_secs(15);
+        }
+
+        // A peer that never announces again (screen off, vendor ROM killed the
+        // service, DHCP change) leaves the pending text undelivered. Retry on a
+        // timer instead of waiting forever for the next announcement.
+        if now >= next_pending_retry {
+            next_pending_retry = now + Duration::from_secs(15);
+            let pending = latest_pending_text
+                .lock()
+                .ok()
+                .and_then(|pending| pending.clone());
+            if let Some(text) = pending {
+                if let Err(error) =
+                    broadcast_clipboard_text(&store_path, &local, latest_pending_text.clone(), text)
+                {
+                    eprintln!("pending clipboard retry failed: {error}");
+                }
+            }
         }
 
         let change_was_reported = match clipboard.wait_for_change(Duration::from_millis(500)) {
@@ -191,23 +220,42 @@ fn run_daemon() -> io::Result<()> {
             next_forced_clipboard_check = now + Duration::from_secs(2);
         }
 
-        match clipboard.change_count() {
-            Ok(Some(change_count)) if last_change_count == Some(change_count) => {
-                // Native sequence counters are authoritative. Do not open and
-                // read the clipboard on a timer when nothing changed; on busy
-                // Windows apps that needless polling can contend with Copy.
-                continue;
+        let change_count = match clipboard.change_count() {
+            Ok(value) => value,
+            Err(error) => {
+                eprintln!("clipboard change count error: {error}");
+                None
             }
-            Ok(Some(change_count)) => {
-                last_change_count = Some(change_count);
+        };
+
+        // Native sequence counters are authoritative when the platform has
+        // one: do not open and read the clipboard on a timer when nothing
+        // changed; on busy Windows apps that needless polling can contend with
+        // Copy. Platforms without a counter fall back to the listener event or
+        // the periodic poll.
+        let counter_changed = match change_count {
+            Some(change_count) => {
+                let changed = last_change_count != Some(change_count);
+                if changed {
+                    last_change_count = Some(change_count);
+                }
+                changed
             }
-            Ok(None) if !change_was_reported && !forced_clipboard_check => continue,
-            Ok(None) => {}
-            Err(error) => eprintln!("clipboard change count error: {error}"),
+            None => false,
+        };
+        let fallback_signal = change_was_reported || forced_clipboard_check;
+        let should_read = clipboard_read_pending
+            || match change_count {
+                Some(_) => counter_changed,
+                None => fallback_signal,
+            };
+        if !should_read {
+            continue;
         }
 
         match clipboard.read_text() {
             Ok(Some(text)) => {
+                clipboard_read_pending = false;
                 if last_seen_text.as_deref() == Some(text.as_str()) {
                     continue;
                 }
@@ -215,10 +263,28 @@ fn run_daemon() -> io::Result<()> {
                 if should_suppress(&clipboard_echo_guard, &text) {
                     continue;
                 }
-                broadcast_clipboard_text(&store_path, &local, latest_pending_text.clone(), text)?;
+                // Discovery or socket trouble must never stop clipboard
+                // monitoring. The text stays pending and is retried when the
+                // peer announces itself or on the periodic retry tick.
+                if let Err(error) =
+                    broadcast_clipboard_text(&store_path, &local, latest_pending_text.clone(), text)
+                {
+                    eprintln!("clipboard broadcast failed: {error}");
+                }
             }
-            Ok(_) => last_seen_text = None,
-            Err(error) => eprintln!("clipboard read error: {error}"),
+            Ok(_) => {
+                clipboard_read_pending = false;
+                // Empty or non-text clipboard invalidates the snapshot so a
+                // later copy of the same text is still broadcast.
+                last_seen_text = None;
+            }
+            Err(error) => {
+                // The sequence counter already advanced, so this copy is only
+                // observable once. Retry on the next tick instead of silently
+                // dropping the user's copy when the clipboard was busy.
+                clipboard_read_pending = true;
+                eprintln!("clipboard read error: {error}; retrying");
+            }
         }
     }
 }
@@ -298,12 +364,17 @@ fn spawn_discovery_listener(
                                 .ok()
                                 .and_then(|text| text.clone());
                             if let Some(text) = pending {
-                                broadcast_clipboard_text(
+                                // This resend runs on the announcement path; a
+                                // failure must not tear down the listener that
+                                // keeps endpoints and trust fresh.
+                                if let Err(error) = broadcast_clipboard_text(
                                     &store_path,
                                     &local,
                                     latest_pending_text.clone(),
                                     text,
-                                )?;
+                                ) {
+                                    eprintln!("announce resend failed: {error}");
+                                }
                             }
                         }
                     }
@@ -575,6 +646,65 @@ mod clipboard_echo_tests {
     }
 }
 
+#[cfg(test)]
+mod broadcast_pending_tests {
+    use super::*;
+    use span_core::Platform;
+
+    fn temp_store(name: &str) -> std::path::PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("span-broadcast-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}.lock", path.display()));
+        path
+    }
+
+    fn local_device() -> LocalDevice {
+        LocalDevice {
+            id: DeviceId::new("test-pc").unwrap(),
+            name: "Test PC".to_string(),
+            platform: Platform::Windows,
+            private_key: [1; 32],
+            public_key: [2; 32],
+        }
+    }
+
+    #[test]
+    fn trusted_peer_without_address_keeps_text_queued() {
+        let path = temp_store("pending-address.tsv");
+        let mut store = TrustStore::load(&path).unwrap();
+        store
+            .trust(
+                DeviceId::new("phone").unwrap(),
+                "Phone".to_string(),
+                Platform::Android,
+                None,
+                Some("aa".repeat(32)),
+            )
+            .unwrap();
+
+        let pending = Arc::new(Mutex::new(None::<String>));
+        // Endpoint refresh may legitimately find nothing on a network-less CI
+        // runner; the queued text must survive every outcome because nothing
+        // was actually delivered to the peer.
+        let _ = broadcast_clipboard_text(
+            &path,
+            &local_device(),
+            pending.clone(),
+            "hello from the pc".to_string(),
+        );
+
+        assert_eq!(
+            pending.lock().unwrap().as_deref(),
+            Some("hello from the pc"),
+            "a trusted device without an address must not drop the queued text"
+        );
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}.lock", path.display()));
+    }
+}
+
 fn broadcast_clipboard_text(
     store_path: &std::path::Path,
     local: &LocalDevice,
@@ -594,25 +724,46 @@ fn broadcast_clipboard_text(
         .collect::<Vec<_>>();
     let mut failed = false;
 
+    if targets.is_empty() {
+        println!("no trusted device is ready to receive clipboard text");
+    }
+
     for device in targets {
+        // A trusted device without an address or key did not receive the
+        // text. Treat that as an outstanding delivery so the pending item is
+        // retried when the peer announces itself instead of being dropped.
         let Some(endpoint) = device.endpoint.as_deref() else {
+            println!("waiting for {} to announce its address", device.name);
+            failed = true;
             continue;
         };
 
         let Some(public_key) = device.public_key.as_deref() else {
+            println!("waiting for {} to share a public key", device.name);
+            failed = true;
             continue;
         };
 
-        let packet = encrypt_text(&local.id, &local.private_key, public_key, &text)?;
+        let packet = match encrypt_text(&local.id, &local.private_key, public_key, &text) {
+            Ok(packet) => packet,
+            Err(error) => {
+                eprintln!("encrypt for {} failed: {error}", device.name);
+                failed = true;
+                continue;
+            }
+        };
 
         match send_text((endpoint, TEXT_PORT), &packet) {
             Ok(()) => println!("sent text to {}", device.name),
             Err(error) => {
                 eprintln!("send to {} at {endpoint} failed: {error}", device.name);
-                if retry_send_after_discovery(store_path, local, &device, &packet)? {
-                    println!("sent text to {} after discovery refresh", device.name);
-                } else {
-                    failed = true;
+                match retry_send_after_discovery(store_path, local, &device, &packet) {
+                    Ok(true) => println!("sent text to {} after discovery refresh", device.name),
+                    Ok(false) => failed = true,
+                    Err(retry_error) => {
+                        eprintln!("discovery retry for {} failed: {retry_error}", device.name);
+                        failed = true;
+                    }
                 }
             }
         }
@@ -988,25 +1139,27 @@ fn send_command(args: Vec<String>) -> io::Result<()> {
     let local = load_or_create_local_device()?;
     let store_path = trust_store_path()?;
     let store = TrustStore::load(&store_path)?;
-    let targets = store
-        .trusted_devices()
-        .into_iter()
-        .filter(|device| device.endpoint.is_some() && device.public_key.is_some())
-        .count();
+    let trusted_count = store.trusted_devices().len();
 
-    if targets == 0 {
+    if trusted_count == 0 {
         println!("No trusted devices are ready.");
         println!("Run `span discover`, then `span accept`.");
         return Ok(());
     }
 
-    broadcast_clipboard_text(
-        &store_path,
-        &local,
-        Arc::new(Mutex::new(None::<String>)),
-        text,
-    )?;
-    println!("Sent to {targets} trusted device(s).");
+    let pending = Arc::new(Mutex::new(None::<String>));
+    broadcast_clipboard_text(&store_path, &local, pending.clone(), text)?;
+    let undelivered = pending
+        .lock()
+        .ok()
+        .map(|pending| pending.is_some())
+        .unwrap_or(false);
+    if undelivered {
+        println!("Some trusted devices are offline; the text stays queued.");
+        println!("Run `span devices` to check each endpoint.");
+    } else {
+        println!("Sent to {trusted_count} trusted device(s).");
+    }
     Ok(())
 }
 

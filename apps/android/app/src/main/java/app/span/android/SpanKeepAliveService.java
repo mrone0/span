@@ -9,6 +9,7 @@ import android.graphics.PixelFormat;
 import android.os.Handler;
 import android.os.Looper;
 import android.provider.Settings;
+import android.util.Log;
 import android.view.Gravity;
 import android.view.View;
 import android.view.WindowManager;
@@ -31,6 +32,7 @@ import java.util.concurrent.RejectedExecutionException;
  * user switches into another app to paste.
  */
 public final class SpanKeepAliveService extends AccessibilityService {
+    private static final String TAG = "SpanKeepAlive";
     private static final long HEARTBEAT_MILLIS = 60_000;
     private static final long EVENT_RETRY_DEBOUNCE_MILLIS = 500;
     private static final long CLIPBOARD_FOCUS_TIMEOUT_MILLIS = 1_200;
@@ -81,7 +83,7 @@ public final class SpanKeepAliveService extends AccessibilityService {
         handler.removeCallbacks(heartbeat);
         ensureReceiver();
         writePendingClipboardWithoutActivity();
-        if (SpanReceiveService.isRunning()) SpanReceiveService.start(this);
+        startReceiverSafely();
         handler.postDelayed(heartbeat, HEARTBEAT_MILLIS);
     }
 
@@ -120,7 +122,7 @@ public final class SpanKeepAliveService extends AccessibilityService {
         }
         SpanKeepAliveService current = activeService.get();
         if (current == this) activeService = new WeakReference<>(null);
-        if (SpanReceiveService.isRunning()) SpanReceiveService.start(this);
+        if (SpanReceiveService.isRunning()) startReceiverSafely();
         super.onDestroy();
     }
 
@@ -278,7 +280,22 @@ public final class SpanKeepAliveService extends AccessibilityService {
 
     private void ensureReceiver() {
         if (!new SpanStore(this).isReceiverEnabled()) return;
-        if (!SpanReceiveService.isRunning()) SpanReceiveService.start(this);
+        if (!SpanReceiveService.isRunning()) startReceiverSafely();
+    }
+
+    /**
+     * Android 12+ can refuse a foreground-service start made from the
+     * background. That refusal must never escape into the accessibility
+     * callbacks: this watchdog is the only component that restores the LAN
+     * listener, and a crash here would leave Span silent while it still looks
+     * alive to the user.
+     */
+    private void startReceiverSafely() {
+        try {
+            SpanReceiveService.start(this);
+        } catch (RuntimeException error) {
+            Log.w(TAG, "Could not start the Span LAN receiver", error);
+        }
     }
 
     static boolean requestClipboardRetry() {
